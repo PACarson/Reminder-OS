@@ -1,0 +1,37 @@
+/**
+ * 00_Project_Constitution.gs
+ * Reminder OS v1.0 — 项目宪法
+ *
+ * 平台级原则的权威定义在 Personal AI Core 项目的
+ * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
+ *
+ * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 物理拆分而来，首次创建。
+ */
+
+/**
+ * P1. 定位
+ *     全平台共享的时间与通知服务。不是 Productivity OS 专属——现在读
+ *     Tasks 表判断该不该提醒；未来 Property/Finance/Vehicle OS 只要往
+ *     共享 Spreadsheet 写自己的表，这个项目加一段"也查那张表"的逻辑，
+ *     就能复用同一套提醒/通知机制，不需要每个 Domain OS 各自重新做一套
+ *     （见 Core 项目 Constitution D2/D5）。
+ *
+ * P2. 部署形态
+ *     独立 Apps Script 项目，完全自主运作：自己的时间触发器
+ *     （checkReminders，每小时）主动醒来、主动查、主动发 Telegram 消息。
+ *     不接 Telegram webhook，不被任何项目当 Library 调用，也不调用任何
+ *     项目的代码——跟 Personal AI Core / Productivity OS 之间唯一的联系
+ *     是"读写同一张共享 Google Sheet"。
+ *
+ * P3. 数据边界
+ *     只读 Tasks 表（属于 Productivity OS 的地盘），只写 Tasks 表的
+ *     reminder_count/last_reminder_at 两个字段（直接 upsertRowByKey_，
+ *     不通过 Productivity OS）+ 追加自己的 REMINDER_SENT 事件到共享
+ *     Events 表。不碰 Tasks 表的其他字段，不碰 ActiveTasks/ArchiveTasks。
+ *
+ * P4. 不变的东西（沿用 Core 宪法）：
+ *     _shouldRemind 的判断逻辑（含已知的 HIGH RISK 2——缺 due_date 临近性
+ *     判断）从 Core 拆分过来时原样保留，没有夹带修复。REMINDER_INTERVAL_HOURS
+ *     的数值也原样保留。改这些属于"修 bug"，不属于这次"拆分"的范围，
+ *     真要改去排单独的任务，见 00_Project_State.gs「已知Bug」。
+ */
