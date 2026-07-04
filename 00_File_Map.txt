@@ -1,0 +1,43 @@
+/**
+ * 00_File_Map.gs
+ * Reminder OS v1.0 — 文件地图
+ *
+ * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ */
+
+/**
+ * 92_ReminderEngine.gs — 【2026-07-03 拆分改动 2 处】
+ *   checkReminders（每小时触发器入口）/ _shouldRemind / _isOverdue /
+ *   _buildReminder / _sendReminder / _updateReminderCount。
+ *   改动1：checkReminders() 里 getPendingTasks() → QueryEngine.getPendingTasks()
+ *   改动2：_updateReminderCount() 里 _materializeTaskRow_(...) →
+ *          upsertRowByKey_('Tasks', 'task_id', task.task_id, task)
+ *   判断逻辑（含已知 HIGH RISK 2）逐字未改，见 00_Project_State.gs。
+ *
+ * 01_SecureConfig.gs — 本地副本，逐字未改。
+ * 03_Output.gs — 本地副本，逐字未改（本项目直接用它发提醒消息）。
+ * 12_QueryEngine.gs — 精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。
+ * 05_SheetUtils.gs — 【modified】getSheet_() 改用 SpreadsheetApp.openById。
+ * 02_EventBus.gs — 精简版：只发 REMINDER_SENT，不需要本地
+ *   ProjectionEngine（EventBus.publish() 内部的
+ *   "typeof ProjectionEngine !== 'undefined'"检查会安全跳过）。
+ * 15_Setup.gs — 新文件：createTriggers（挂 checkReminders）/ runDiagnostics。
+ */
+
+/**
+ * 模块关系：
+ *
+ * 92_ReminderEngine.gs
+ *   → QueryEngine.getPendingTasks()
+ *   → 05_SheetUtils.gs (isOverdue_, upsertRowByKey_)
+ *   → 03_Output.gs (sendMessage)
+ *   → 02_EventBus.gs (publish)
+ *
+ * 12_QueryEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ * 02_EventBus.gs → 01_SecureConfig.gs (getKey('SPREADSHEET_ID'))
+ *
+ * 本项目不依赖 Personal AI Core / Productivity OS 的任何代码，只是读写
+ * 同一张共享 Spreadsheet 里 Productivity OS 拥有的 Tasks 表（读全部字段+
+ * 写 reminder_count/last_reminder_at 两个字段）和共享的 Events 表
+ * （只追加，不读不改别人写的行）。
+ */
