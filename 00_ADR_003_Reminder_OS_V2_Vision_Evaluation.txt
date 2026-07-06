@@ -1,0 +1,107 @@
+/**
+ * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs
+ * Reminder OS — 架构决策记录 #003
+ *
+ * STATUS: Proposed — 范围需要 Carson 拍板，见下方「建议」
+ * DATE: 2026-07-06
+ */
+
+/**
+ * === 背景 ===
+ *
+ * 收到一份"Reminder OS V2 (AI-Native Reminder Platform)"的完整 Prompt，
+ * 核心诉求：把现在这个"只会查 Tasks 表 due_date、按优先级发提醒"的单一
+ * ReminderEngine，升级成服务全部 Domain OS 的平台级提醒基础设施，包含：
+ *   - 7个新 Runtime 引擎：Rule Engine（后来建议拆成 Temporal Engine +
+ *     Reminder Engine）/ Scheduler / Dispatcher / History / Escalation /
+ *     Snooze / Analytics
+ *   - Foundation 新增 10 个 schema 概念（Reminder Rule/Schedule/Window/
+ *     Escalation Policy/History/Analytics/Channel/State/Timezone/
+ *     Preferences）
+ *   - Intelligence 层预留 5 个未来 AI 模块
+ *   - Integration 层支持 8 个 Domain OS（Productivity/Finance/Inventory/
+ *     Property/Vehicle/Health/Shopping/Travel）
+ *   - 11 种新 Event 类型
+ * 明确要求：只生成 governance 文档（Constitution/State/File_Map/ADR），
+ * 不生成任何实现代码。
+ *
+ * === 评估 ===
+ *
+ * 好的部分，而且不小：
+ *   1. "Reminder OS 是全平台共享服务、不是 Productivity OS 专属"这个
+ *      定位本身不是新东西——00_Project_Constitution.gs 的 P1 从
+ *      2026-07-03 拆分那天起就是这么写的。这份 proposal 没有改变方向，
+ *      只是提议在这个已经确立的方向上走得更远、更快。
+ *   2. 建议把"Reminder Rule Engine"拆成"Temporal Engine（时间引擎）+
+ *      Reminder Engine（提醒引擎）"——这个判断是对的。"每N天/每月最后
+ *      一天/特定星期几"这类日期规则计算，跟"要不要因为这个规则发提醒"
+ *      是两件可以分开的事，前者对 Finance（账单周期）、Property（租金
+ *      周期）、Vehicle（保养周期）这些 OS 同样有用，不是提醒专属的东西。
+ *      这是这份 proposal 里最站得住脚的一条架构判断。
+ *   3. "Recurring 提醒"确实是当前系统一个真实存在的缺口，不是凭空想象
+ *      出来的需求——现在的 25_ReminderEngine.gs 只认单次 due_date，
+ *      没有"每周一提醒我"这种能力。这一点不需要等未来的 Domain OS 出现
+ *      才成立，现在就缺。
+ *
+ * 让我没法直接照单全收的地方：
+ *   1. 跟 P6 冲突。现在的系统是"一个函数（checkReminders）+ 一种规则
+ *      形状（due_date + priority）"，proposal 要求一次性规划 7 个引擎 +
+ *      10 个 schema 概念 + 5 个 AI 模块预留 + 8 个 Domain OS 集成 + 11 种
+ *      事件类型——这个规模是现状的十几倍，而且大半是为还不存在的东西
+ *      预留的（Vehicle/Health/Shopping/Travel OS 目前都没有代码；
+ *      Escalation/Snooze/Analytics/多渠道 Dispatcher 目前没有任何具体
+ *      场景在驱动这些需求，是纯粹面向未来的猜测）。
+ *   2. Doc/code drift 风险。要求"只生成 governance 文档，不生成实现
+ *      代码"——如果真按这个规模写 Constitution/File_Map/State，会变成
+ *      一份描述 7 个引擎、几十个函数签名的架构文档，但代码这边一行都
+ *      没有。这正是这个项目系列过去反复出现、也反复被你要求我核实纠正
+ *      的那种"文档说有、代码里没有"的漂移，只是这次是我自己会成为制造者。
+ *   3. Proposal 原话是"设计 governance 使 Claude 以后能独立生成每个引擎、
+ *      不需要未来架构重构"——这个假设是"现在就能一次性想清楚正确设计"。
+ *      但这个项目自己的历史不支持这个假设：recurring task 自动生成当初
+ *      特意收窄成"日/周/月/年、interval=1"这个子集，没有一次性做全；
+ *      外部审计提过的"Hybrid Event Pipeline"因为跟实际同步链路对不上被
+ *      否决。这两次都是"先想清楚一部分、按实际使用情况再扩展"跑赢了
+ *      "一次性设计完整"。这次没理由假设会不一样。
+ *
+ * === 建议 ===
+ *
+ * 不按字面把 7 个引擎当成"已经架构好的现实"写进 Constitution/File_Map/
+ * State——那几份文档现在的角色是"如实反映当前状态"，不是"记录我们的
+ * 野心"。这次改动范围：
+ *
+ *   1. 这份 ADR：把整个 V2 构想、好的部分、担心的部分都记下来，不丢失
+ *      这次讨论——但标注成"Proposed"而不是"Accepted"，范围需要你拍板。
+ *   2. 00_Project_Constitution.gs 只加一条指向性的 P7（"长期方向"），
+ *      不逐条罗列 7 个引擎当作既定架构，只说"未来可能往这个方向发展，
+ *      细节和评估见 ADR-003，目前零实现"。
+ *   3. 00_Project_State.gs 只加一行指向这份 ADR，明确写"V1 仍是当前
+ *      唯一在跑的实现，V2 是方向性讨论，没有任何代码/schema 落地"。
+ *   4. 00_File_Map.gs 不加任何新的"预留"资料夹——Intelligence/Testing
+ *      那两个空文件夹是因为 blueprint 本身六层是你明确要采用的架构骨架；
+ *      这次 7 个引擎是否都要建、要不要建成这个规模，还没有定论，先建一堆
+ *      空文件夹本身就是一种"看起来已经决定了"的暗示，不建。
+ *
+ * 如果你确认要往这个方向走，比字面这份 proposal 更谨慎、也更可能真正
+ * 有用的起步方式：先只做 Temporal Engine 这一块——把"规则字符串 → 下次
+ * 触发时间"这个计算能力做出来（对应 proposal 里的
+ * calculateNextReminder/calculateFutureOccurrences/isReminderDue），
+ * 先支持 Daily/Weekly/Monthly/Yearly/Every-X-days 这几种最常见的，
+ * 让 Reminder OS 真正具备"周期性提醒"这个当前缺失的能力，同时验证这个
+ * 时间引擎的设计好不好用。Escalation/Snooze/Analytics/多渠道 Dispatcher/
+ * Intelligence 这些，等 Temporal Engine 跑起来、真的观察到需求时再逐个
+ * 加——不需要现在就把全部 7 个一次性设计完。这条路径跟这个项目一贯的
+ * "先做小范围、按实际情况扩展"的做法一致（P6），也是我会建议的下一步，
+ * 但最终范围怎么定，你说了算。
+ *
+ * === 后果 ===
+ *
+ * - 本次不产出任何新的实现代码（不管是 V1 的修改还是 V2 的雏形），符合
+ *   proposal"这次不写实现"的要求。
+ * - Constitution/State 各加一条简短的指向性记录，不包含 V2 proposal 里
+ *   的具体设计细节（那些留在这份 ADR 里，不散落到多份文档，避免以后要
+ *   同步好几处）。
+ * - 如果你确认要推进，下一步是我需要知道：先做 Temporal Engine（我的
+ *   建议），还是坚持按 proposal 原本的规模一次性都规划——不管选哪个，
+ *   之后如果要落地成真实代码，会是单独的实现任务，不会只停留在文档层面。
+ */
