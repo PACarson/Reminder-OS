@@ -13,6 +13,11 @@
  * TELEGRAM_TOKEN 各自独立的存在性检查，比重建版更细。
  * ]
  *
+ * 🐛 2026-07-06（同日，稍晚）外部审计修复（MEDIUM RISK 1 关联，核实属实
+ * 后采纳）：runDiagnostics() 新增了 Telegram webhook 可达性检查（调
+ * getWebhookInfo），其余逻辑逐字未改。完整决策依据见
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.txt。
+ *
  * Reminder OS v1.0 — 一键初始化
  *
  * ⚠️ 2026-07-03 拆分说明：新文件。Reminder OS 不需要建任何新表——它读写的
@@ -68,6 +73,36 @@ function runDiagnostics() {
   var chatId = SecureConfig.getKey('TELEGRAM_CHAT_ID');
   Logger.log(token ? '✅ TELEGRAM_TOKEN 已设置' : '❌ TELEGRAM_TOKEN 没设置');
   Logger.log(chatId ? '✅ TELEGRAM_CHAT_ID 已设置' : '❌ TELEGRAM_CHAT_ID 没设置');
+
+  // 🐛 新增（2026-07-06，外部审计 MEDIUM RISK 1 关联，核实属实后采纳）：
+  // _sendReminder 发的 Done/Snooze 按钮，点击后依赖【另一个项目】
+  // （Personal AI Core）注册了 webhook 才能接住 callback_query——本项目
+  // 自己不接 webhook（见上方文件头注释）。这里只能检测"webhook 有没有
+  // 注册"，检测不了"Core 项目是否正确解析了 task_done:/task_snooze: 这
+  // 两种 callback_data"，后者没法从这边验证，完整契约见
+  // 0_Governance/00_Project_Constitution.gs 新增的 P6。
+  if (token) {
+    try {
+      var webhookRes = UrlFetchApp.fetch(
+        'https://api.telegram.org/bot' + token + '/getWebhookInfo',
+        { muteHttpExceptions: true }
+      );
+      var webhookInfo = JSON.parse(webhookRes.getContentText());
+      if (webhookInfo.ok && webhookInfo.result && webhookInfo.result.url) {
+        Logger.log('✅ Telegram webhook 已注册: ' + webhookInfo.result.url +
+          '（pending_update_count=' + webhookInfo.result.pending_update_count + '）');
+        if (webhookInfo.result.last_error_message) {
+          Logger.log('⚠️ webhook 最近一次投递报错: ' + webhookInfo.result.last_error_message);
+        }
+      } else {
+        Logger.log('❌ Telegram webhook 未注册（url 为空）——这个 Bot 目前在用 getUpdates/' +
+          '长轮询，不是 webhook。如果 Core 项目应该注册了 webhook 来处理本项目提醒消息里的 ' +
+          'Done/Snooze 按钮点击，这里说明两边没对齐，用户点按钮不会有任何反应。');
+      }
+    } catch (e) {
+      Logger.log('❌ getWebhookInfo 请求失败: ' + e.message);
+    }
+  }
 
   if (chatId) {
     try {
