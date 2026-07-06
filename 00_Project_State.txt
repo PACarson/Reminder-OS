@@ -3,8 +3,10 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-06 — 修复 HIGH RISK 2；按 Domain OS Blueprint
- * 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换确认。
+ * LAST_UPDATED: 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
+ * Blueprint 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换
+ * 确认；修复本轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、LOW RISK 1/2
+ * 共6项。
  */
 
 // ============================================================
@@ -37,6 +39,32 @@
  *   Logger.log 输出诊断信息的风格，不返回结构化对象——File_Map/README
  *   当初对这个文件行为的文字描述本身没有问题，纯粹是 zip 打包时这一个
  *   文件被顶替了。
+ *
+ * - 2026-07-06：修复外部审计对 2_Runtime/25_ReminderEngine.gs、
+ *   2_Runtime/20_EventBus.gs 的新一轮发现，按严重程度全部处理，完整决策
+ *   依据见 00_ADR_002_ReminderEngine_Audit_Fixes.gs：
+ *   · HIGH RISK 1：checkReminders 循环里不再逐任务调 upsertRowByKey_
+ *     （O(N)次全表扫描式 Sheet I/O），改成循环内只更新内存、结束后
+ *     batchUpsertRowsByKey_ 一次性批量写回。
+ *   · HIGH RISK 2：_sendReminder 之间加 Utilities.sleep(1000)，避免撞
+ *     Telegram 单聊天每秒最多1条消息的限流（已查官方 Bots FAQ 核实限额）。
+ *   · MEDIUM RISK 1：这个耦合本身没法从 Reminder OS 单边"修掉"（webhook
+ *     注册和 callback 解析都在 Personal AI Core 项目）——补的是文档约束
+ *     （00_Project_Constitution.gs 新增 P6）和诊断可达性检查
+ *     （1_Foundation/11_Setup.gs 的 runDiagnostics() 新增 getWebhookInfo
+ *     检查）。这条严格说是"降低风险+文档化"，不是"消除风险"，见下面
+ *     「已知问题」。
+ *   · MEDIUM RISK 2：25_ReminderEngine.gs 全部逻辑和常量包进 IIFE
+ *     （ReminderEngine 模块），不再平铺全局。对审计原始建议做了修正：
+ *     checkReminders 必须保留一个薄的全局函数转发，因为 GAS 触发器按
+ *     字符串名字找全局函数绑定，找不到 IIFE 返回对象的属性。
+ *   · LOW RISK 1：lock.waitLock 从 5000ms 延长到 30000ms（HIGH RISK 2
+ *     的节流会让单次执行变长，5秒等待太容易误判"前一个没跑完"而跳过）。
+ *   · LOW RISK 2：20_EventBus.gs 的 _sheet_() 新增惰性缓存，同一次执行内
+ *     不再重复 SpreadsheetApp.openById。
+ *   全部6项改动都用 mock GAS 环境跑过针对性验证（批量写入次数、节流调用
+ *   次数、IIFE 封装后内部函数不再泄漏到全局、webhook 诊断两种分支），
+ *   不是只凭代码审查判断"看起来对"。
  */
 
 // ============================================================
@@ -52,6 +80,14 @@
 // ============================================================
 
 /**
+ * - 【持续存在，不是能单边修掉的 bug】MEDIUM RISK 1：Done/Snooze 按钮的
+ *   callback_data 处理依赖 Personal AI Core 项目注册了 Telegram webhook、
+ *   且用同一个 TELEGRAM_TOKEN 正确解析 task_done:/task_snooze: 协议。
+ *   这次只做了文档约束（00_Project_Constitution.gs P6）和 webhook 注册
+ *   状态的诊断（runDiagnostics()），但没法从 Reminder OS 这边验证 Core
+ *   项目是否真的正确处理了这两种 callback_data——如果两边协议后续单方面
+ *   改动，这里不会有任何自动报错，只能靠人工核对两边代码。
+ *
  * - "接V3改EventBus.publish"这条旧 TODO：这次核实，代码（现
  *   2_Runtime/25_ReminderEngine.gs 的 _updateReminderCount）确实已经在调
  *   EventBus.publish('REMINDER_SENT', ...)。跟这条笔记本身的猜测一致——
@@ -76,14 +112,35 @@
  *   3. 这次 blueprint 重组里，21_SheetUtils.gs 和 25_ReminderEngine.gs
  *      都是横跨多个 blueprint 子分类、没有拆分成更小的文件——理由和具体
  *      考虑见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs，如果你希望拆得
- *      更细，可以再单独排。
+ *      更细，可以再单独排。（25_ReminderEngine.gs 内部现在包进了 IIFE，
+ *      物理文件数没变，见 00_ADR_002_ReminderEngine_Audit_Fixes.gs）
  *   4. Domain OS Blueprint 是跨项目的平台级约定，权威定义按惯例应该也记
  *      一份在 Personal AI Core 的 00_Project_Constitution.gs——这次没有
  *      该项目的文件，只更新了 Reminder OS 自己这份，需要的话把 Core 项目
  *      文件也发我，我再同步过去。
+ *   5. 如果想彻底关掉 MEDIUM RISK 1（而不是只做文档约束+诊断），需要把
+ *      Personal AI Core 项目里处理 task_done:/task_snooze: 这两种
+ *      callback_data 的代码也发我核对，确认协议双方真的对齐——单看
+ *      Reminder OS 这边的代码没法验证这件事。
  *
  * 优先级 P3（架构演进）：
- *   5. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
+ *   6. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
+ */
+
+// ============================================================
+// 五、长期方向（讨论中，非既定计划）
+// ============================================================
+
+/**
+ * - 2026-07-06：收到"Reminder OS V2 (AI-Native 提醒平台)"构想（7个新
+ *   Runtime 引擎 + Foundation schema 扩展 + Intelligence 层预留 + 支持
+ *   8个 Domain OS + 11种新 Event 类型）。完整评估（好的部分/担心的部分/
+ *   建议的起步范围）见 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs。
+ *
+ *   ⚠️ 明确记录：这纯粹是方向性讨论，V1（现在这套单一 ReminderEngine，
+ *   只认 due_date + priority）仍是唯一在跑的实现，V2 里提到的任何引擎/
+ *   schema/事件类型都还没有一行代码、也没有物理文件占位。等你确认要不要
+ *   推进、推进到什么范围，再决定下一步是否需要实现任务。
  */
