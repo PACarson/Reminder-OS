@@ -1,0 +1,124 @@
+/**
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.gs
+ * Reminder OS — 架构决策记录 #002
+ *
+ * STATUS: Accepted
+ * DATE: 2026-07-06
+ */
+
+/**
+ * === 背景 ===
+ *
+ * Carson 提供了一份针对 2_Runtime/25_ReminderEngine.gs、2_Runtime/
+ * 20_EventBus.gs 的外部审计报告（审计对象是 2026-07-06 早些时候按
+ * Domain OS Blueprint 重组之后的代码），按严重程度分 HIGH/MEDIUM/LOW
+ * 各两条，要求按严重程度顺序全部修复。
+ *
+ * === 决策：逐条核实 + 修复 ===
+ *
+ * HIGH RISK 1（checkReminders 循环内 O(N) 次全表扫描式 Sheet I/O）
+ *   核实：属实。upsertRowByKey_ 每次调用都会 getLastRow +
+ *   getRange(...).getValues() 扫一遍 key 列找行号，checkReminders 循环
+ *   里每提醒一个任务就调一次，N 个任务 = N 次这样的扫描+写入。
+ *   修复：循环内只更新内存对象、收集进 updatedTasks 数组，循环结束后
+ *   调一次 batchUpsertRowsByKey_('Tasks','task_id',updatedTasks)。这个
+ *   批量函数 21_SheetUtils.gs 里已经有（2026-06-29 为 ProjectionRebuilder
+ *   的全量重建场景加的），直接复用，没有重新实现一份类似逻辑（避免 C5）。
+ *   _updateReminderCount 改名 _recordReminderSent，职责收窄为"发布事件+
+ *   更新内存计数"，不再直接碰 Sheet。
+ *
+ * HIGH RISK 2（Telegram 限流）
+ *   核实：查了 Telegram 官方 Bots FAQ（core.telegram.org/bots/faq）确认：
+ *   单个 chat 里发消息建议不超过每秒1条（短时间可以超一点，但持续超会
+ *   收到429）；单个群组每分钟不超过20条；跨不同chat的批量通知全局大约
+ *   每秒30条上限。本项目的提醒消息几乎都发到同一个 chat_id（Steven 自己
+ *   的 Telegram），所以真正卡脖子的是"单聊每秒1条"这条线，不是全局
+ *   30条/秒那条。
+ *   修复：_sendReminder 之后加 Utilities.sleep(1000)，固定1秒节流。
+ *   没有做更复杂的 per-chat/全局分别限流（比如 token bucket），因为
+ *   目前场景就是单一/极少数 chat_id，复杂方案在还没出现多用户场景之前
+ *   属于过度设计（P6）。如果以后 Reminder OS 真的服务多个不同 chat_id
+ *   的用户，这里需要重新设计成不阻塞彼此的独立节流，到时候再做。
+ *
+ * MEDIUM RISK 1（Done/Snooze 按钮依赖 Core 项目的 webhook）
+ *   核实：属实，而且这个耦合是架构层面的，不是这个文件能单独"修掉"的
+ *   bug——webhook 注册和 callback_data 解析都发生在 Personal AI Core
+ *   项目，Reminder OS 这边看不到、也管不了那边的代码。
+ *   处理方式（不是"修复"，是"文档化+可诊断化"）：
+ *     1. 00_Project_Constitution.gs 新增 P6，把这个跨项目契约的具体格式
+ *        （'task_done:{task_id}'/'task_snooze:{task_id}'）、依赖关系
+ *        （同一个 TELEGRAM_TOKEN、Core 必须实现这两种前缀的解析）明确写
+ *        下来，不再是"两边心照不宣"的隐性假设。
+ *     2. 1_Foundation/11_Setup.gs 的 runDiagnostics() 新增调用 Telegram
+ *        getWebhookInfo（查了 core.telegram.org/bots/api 确认这是官方
+ *        无参数 GET 方法，返回 WebhookInfo 对象，url 为空代表当前没有
+ *        注册 webhook、在用 getUpdates/长轮询），可以在部署时或怀疑按钮
+ *        失灵时手动跑一次，看 webhook 是不是真的挂着。
+ *     这两步只能验证"webhook 有没有注册"，验证不了"Core 项目是否正确
+ *     解析了这两种 callback_data"——那需要看 Core 项目的代码，这次没有
+ *     拿到，见 00_Project_State.gs「已知问题」和「下一步」。
+ *
+ * MEDIUM RISK 2（全局命名空间污染风险）
+ *   核实：属实。25_ReminderEngine.gs 之前所有常量和函数都平铺在全局
+ *   作用域，跟 22_QueryEngine.gs/40_Output.gs 的 IIFE 写法不一致。
+ *   修复：包进 var ReminderEngine = (function(){...})() IIFE，只
+ *   return { checkReminders: checkReminders }。
+ *
+ *   ⚠️ 对审计原始建议的修正：审计建议"仅将必要的入口函数（如
+ *   checkReminders）暴露给全局"——如果照字面理解成"checkReminders 只作为
+ *   ReminderEngine 返回对象的属性存在"，会直接破坏触发器。GAS 的
+ *   ScriptApp.newTrigger('checkReminders') 是运行时按【字符串名字】在
+ *   全局作用域找一个函数声明来绑定，不会去解析 ReminderEngine.
+ *   checkReminders 这种路径——真这么做的话，1_Foundation/11_Setup.gs 的
+ *   createTriggers() 建出来的触发器会在每小时触发时找不到对应函数直接
+ *   报错，提醒系统会整个停摆。
+ *   实际做法：IIFE 内部保留完整实现，IIFE 外面单独留一个同名全局薄封装
+ *   `function checkReminders() { return ReminderEngine.checkReminders(); }`，
+ *   只做转发，不含业务逻辑。这是"审计的方向对，但字面建议在 GAS 环境下
+ *   有一个没考虑到的平台约束"的例子——采纳了修复意图，修正了具体做法。
+ *
+ * LOW RISK 1（lock.waitLock 超时太短）
+ *   核实：属实，原来是 5000ms。
+ *   修复：延长到 30000ms。额外考虑：HIGH RISK 2 加的节流会让单次
+ *   checkReminders 的正常耗时变长（每条提醒多等1秒），5秒的锁等待在这个
+ *   改动之后会更容易被触发误判，所以这次不只是简单调大数字，而是重新
+ *   核对了新的预期耗时量级再定的 30 秒——仍然只占 GAS 6分钟执行上限的
+ *   一小部分。
+ *
+ * LOW RISK 2（EventBus 重复 openById）
+ *   核实：属实。_sheet_() 每次调用都重新走
+ *   SecureConfig.getKey('SPREADSHEET_ID') + SpreadsheetApp.openById()。
+ *   修复：闭包里加 _cachedSheet，命中就直接返回，不重新打开。GAS 的
+ *   Sheet 对象是"引用"不是数据快照，缓存引用不会读到过期数据，只是省掉
+ *   重复打开的开销；缓存的生命周期等于本次执行，不存在跨执行脏缓存。
+ *
+ * === 验证方式 ===
+ *
+ * 6 项改动都不是只凭代码审查判断"看起来对"，而是各自写了针对性的
+ * mock GAS 环境脚本跑过：
+ *   - ReminderEngine：mock QueryEngine/EventBus/Output/LockService/
+ *     Utilities/batchUpsertRowsByKey_，验证 batchUpsertRowsByKey_ 恰好
+ *     被调 1 次（不是 N 次）、Utilities.sleep 恰好按发送次数调用、IIFE
+ *     封装后 _shouldRemind 等内部函数确认不再泄漏到全局、上一轮
+ *     HIGH RISK 2（due_date 提前量）的判断逻辑在这轮改动后依然正确。
+ *   - EventBus：mock SpreadsheetApp，验证连续 3 次 publish() +
+ *     1 次 getAllEvents() 只触发 1 次 openById，且数据仍然正确写入
+ *     （证明缓存的是"引用"，行为没变）。
+ *   - Setup 的 webhook 诊断：mock UrlFetchApp 分别模拟"webhook 已注册"
+ *     和"webhook 未注册（url 为空）"两种响应，确认两个分支的 Logger 输出
+ *     都符合预期。
+ *
+ * === 后果 ===
+ *
+ * - 2_Runtime/25_ReminderEngine.gs：结构性改动最大，从平铺全局改成 IIFE
+ *   模块 + 一个薄的全局触发器转发函数；checkReminders/_recordReminderSent
+ *   内部逻辑改成批量+节流。对外行为（发消息内容、按钮、事件类型）不变。
+ * - 2_Runtime/20_EventBus.gs：只加了一层缓存，公开 API 和行为不变。
+ * - 1_Foundation/11_Setup.gs：runDiagnostics() 新增一段 webhook 检查，
+ *   createTriggers() 未改动。
+ * - 00_Project_Constitution.gs：新增 P6，修订 P3（写入机制描述更新为
+ *   批量），修订 P5（去掉 Setup.gs 待确认的过时标注）。
+ * - MEDIUM RISK 1 严格来说没有被"消除"，只是被"文档化+加了诊断"——这是
+ *   本次 6 项里唯一一条本质上无法在 Reminder OS 单个项目内彻底解决的，
+ *   如实记录在 00_Project_State.gs「已知问题」，不假装它已经修好了。
+ */
