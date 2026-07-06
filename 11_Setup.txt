@@ -1,0 +1,70 @@
+/**
+ * 11_Setup.gs   [原 15_Setup.gs — 2026-07-06 按 Domain OS Blueprint 迁入
+ * 1_Foundation/（Configuration 子分类为主；runDiagnostics 那部分严格算
+ * 是 Testing/Validation，但整份文件不到 40 行，为了不过度拆分（P6）先
+ * 放一起，没有强行拆成两个文件）。]
+ *
+ * ⚠️⚠️ 2026-07-06 重建说明，请务必核对 ⚠️⚠️
+ * 你这次上传的 15_Setup.txt，文件内容实际是 12_QueryEngine.txt 的完整
+ * 复制（连文件头注释都写的是"12_QueryEngine.gs"），不是 Setup 该有的
+ * createTriggers/runDiagnostics——大概率是打包/上传这个 zip 时的复制粘贴
+ * 失误，不是你 Apps Script 项目里真实的样子。
+ *
+ * 下面这份是我（Claude）根据 00_File_Map.txt 和 README.md 里对 15_Setup.gs
+ * 行为的文字描述反推重建的，不是你的原始代码：
+ *   - createTriggers()：挂 checkReminders 的每小时时间触发器
+ *   - runDiagnostics()：验证"能读到 Tasks 表" + 发一条测试 Telegram 消息
+ * 这两个函数具体应该长什么样（有没有去重逻辑、诊断输出格式、还检查了什么）
+ * 我没有依据，只能按最常见、最保守的写法猜。请拿你 Apps Script 编辑器里
+ * 真实的 15_Setup.gs 内容跟下面对一下，不一致的话麻烦把真实内容发我，
+ * 我再替换成真的（这份不算这次"已完成"的一部分，算待确认项，见
+ * 00_Project_State.txt）。
+ */
+
+function createTriggers() {
+  // 先删掉所有已存在的 checkReminders 触发器，避免重复跑这个函数会叠加
+  // 出两个同名 trigger（这点是我加的防御性处理，你原来的版本不一定有）
+  var triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function (t) {
+    if (t.getHandlerFunction() === 'checkReminders') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('checkReminders')
+    .timeBased()
+    .everyHours(1)
+    .create();
+
+  Logger.log('[Setup] checkReminders 触发器已建立（每小时）');
+  return { ok: true };
+}
+
+function runDiagnostics() {
+  var result = { ok: true, checks: {} };
+
+  // 1. 能否读到共享 Spreadsheet 的 Tasks 表
+  try {
+    var tasks = QueryEngine.getPendingTasks();
+    result.checks.tasks_sheet_readable = true;
+    result.checks.pending_task_count = tasks.length;
+  } catch (e) {
+    result.ok = false;
+    result.checks.tasks_sheet_readable = false;
+    result.checks.tasks_sheet_error = e.message;
+  }
+
+  // 2. 能否发出一条测试 Telegram 消息
+  try {
+    var chatId = SecureConfig.getKey('TELEGRAM_CHAT_ID');
+    var sendResult = Output.sendMessage(chatId, '✅ Reminder OS runDiagnostics() 测试消息');
+    result.checks.telegram_send = !!(sendResult && sendResult.ok);
+  } catch (e) {
+    result.ok = false;
+    result.checks.telegram_send = false;
+    result.checks.telegram_error = e.message;
+  }
+
+  Logger.log('[Setup] runDiagnostics 结果: ' + JSON.stringify(result));
+  return result;
+}

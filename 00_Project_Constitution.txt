@@ -5,7 +5,8 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 物理拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — 新增 P5（Domain OS Blueprint 落地采用），
+ * 修订 P4（HIGH RISK 2 已修复，原文作为拆分时点的历史记录保留）。
  */
 
 /**
@@ -29,9 +30,44 @@
  *     不通过 Productivity OS）+ 追加自己的 REMINDER_SENT 事件到共享
  *     Events 表。不碰 Tasks 表的其他字段，不碰 ActiveTasks/ArchiveTasks。
  *
- * P4. 不变的东西（沿用 Core 宪法）：
- *     _shouldRemind 的判断逻辑（含已知的 HIGH RISK 2——缺 due_date 临近性
- *     判断）从 Core 拆分过来时原样保留，没有夹带修复。REMINDER_INTERVAL_HOURS
- *     的数值也原样保留。改这些属于"修 bug"，不属于这次"拆分"的范围，
- *     真要改去排单独的任务，见 00_Project_State.gs「已知Bug」。
+ * P4. 不变的东西（沿用 Core 宪法，历史记录）：
+ *     2026-07-03 从 Core 拆分时：_shouldRemind 的判断逻辑（含当时已知的
+ *     HIGH RISK 2——缺 due_date 临近性判断）原样保留，没有夹带修复。
+ *     REMINDER_INTERVAL_HOURS 的数值也原样保留。改这些属于"修 bug"，
+ *     不属于当时"拆分"的范围。
+ *
+ *     ✅ 2026-07-06 更新：HIGH RISK 2 已修复（新增 REMINDER_ADVANCE_HOURS
+ *     提前量判断，未逾期且距 due_date 太远时不提醒），见
+ *     2_Runtime/25_ReminderEngine.gs 的 "2026-07-06 bugfix" 注释和
+ *     00_Project_State.gs「已完成」。REMINDER_INTERVAL_HOURS 数值本身
+ *     没有变。这条 P4 上半段保留作为拆分时点的历史记录，不代表当前状态——
+ *     当前状态以这一段"✅ 2026-07-06"为准。
+ *
+ * P5. 架构分层（Domain OS Blueprint，2026-07-06 采用）
+ *     本项目从这次起，文件按平台统一的 Domain OS Blueprint 分层组织：
+ *     0.Governance / 1.Foundation / 2.Runtime / 3.Intelligence /
+ *     4.Integration / 5.Testing。
+ *
+ *     这份 blueprint 是跨所有 Domain OS 项目的平台级约定，按 P1 开头那句
+ *     "平台级原则的权威定义在 Personal AI Core" 的一贯做法，理论上权威/
+ *     完整定义也该记在 Core 项目的 00_Project_Constitution.gs 里——但这次
+ *     只有 Reminder OS 的代码给到我（Claude）看，Core 项目的文件我这边
+ *     没有，所以没有一并去改那边。这里先把本次采用的版本记一份本地副本；
+ *     如果 Core 项目那边后续也记了权威版本、或者两边对不上，以 Core 那边
+ *     为准，记得回来同步这里。
+ *
+ *     Reminder OS 目前只用到其中三层：
+ *       - Foundation（Configuration：SecureConfig；另外 Setup 的 createTriggers
+ *         部分也算这层，细节见 P4 之外的 1_Foundation/11_Setup.gs 文件头，
+ *         那个文件内容有待你确认，见 00_Project_State.gs）
+ *       - Runtime（Event / Projection / Query / Decision / Execution，
+ *         对应 EventBus / SheetUtils / QueryEngine / ReminderEngine）
+ *       - Integration（APIs：Output.gs 对接 Telegram Bot API）
+ *     Intelligence 和 Testing 两层暂无内容，文件夹保留但是空的——不代表
+ *     "漏做了"，纯粹是这个 OS 目前的功能范围用不到，具体理由见对应文件夹
+ *     下的 _RESERVED.txt。
+ *
+ *     哪个文件对应 blueprint 的哪一层/哪个子分类、为什么某些文件（比如
+ *     21_SheetUtils.gs、25_ReminderEngine.gs）横跨多层没有拆分，完整依据
+ *     见 00_File_Map.txt 和 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。
  */

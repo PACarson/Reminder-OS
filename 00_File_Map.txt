@@ -2,42 +2,111 @@
  * 00_File_Map.gs
  * Reminder OS v1.0 — 文件地图
  *
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写。旧版本
+ * （扁平编号 00/01/02/03/05/12/15/92）的内容已经并入下面每个文件条目里，
+ * 判断逻辑变化只有 HIGH RISK 2 这一处，其余都是物理位置+文件名+文档变化。
+ * 完整决策依据见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs。
  */
 
-/**
- * 92_ReminderEngine.gs — 【2026-07-03 拆分改动 2 处】
- *   checkReminders（每小时触发器入口）/ _shouldRemind / _isOverdue /
- *   _buildReminder / _sendReminder / _updateReminderCount。
- *   改动1：checkReminders() 里 getPendingTasks() → QueryEngine.getPendingTasks()
- *   改动2：_updateReminderCount() 里 _materializeTaskRow_(...) →
- *          upsertRowByKey_('Tasks', 'task_id', task.task_id, task)
- *   判断逻辑（含已知 HIGH RISK 2）逐字未改，见 00_Project_State.gs。
- *
- * 01_SecureConfig.gs — 本地副本，逐字未改。
- * 03_Output.gs — 本地副本，逐字未改（本项目直接用它发提醒消息）。
- * 12_QueryEngine.gs — 精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。
- * 05_SheetUtils.gs — 【modified】getSheet_() 改用 SpreadsheetApp.openById。
- * 02_EventBus.gs — 精简版：只发 REMINDER_SENT，不需要本地
- *   ProjectionEngine（EventBus.publish() 内部的
- *   "typeof ProjectionEngine !== 'undefined'"检查会安全跳过）。
- * 15_Setup.gs — 新文件：createTriggers（挂 checkReminders）/ runDiagnostics。
- */
+// ============================================================
+// 一、按 blueprint 层级列出的文件
+// ============================================================
 
 /**
- * 模块关系：
+ * ── 0_Governance ──────────────────────────────────────────
  *
- * 92_ReminderEngine.gs
- *   → QueryEngine.getPendingTasks()
- *   → 05_SheetUtils.gs (isOverdue_, upsertRowByKey_)
- *   → 03_Output.gs (sendMessage)
- *   → 02_EventBus.gs (publish)
+ * 00_Project_Constitution.gs — 项目宪法。P1-P3 未变，P4 更新为
+ *   "HIGH RISK 2 已修复"，新增 P5 记录 Domain OS Blueprint 采用。
+ * 00_Project_State.gs — 项目状态快照。本次更新：HIGH RISK 2 移到「已完成」，
+ *   新增「已知问题」——15_Setup.txt 内容对不上（见下）。
+ * 00_File_Map.gs — 本文件。
+ * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs — 【新增】记录这次采用
+ *   blueprint 的背景、号段分配、文件映射表、以及几个关键判断（为什么
+ *   SheetUtils/ReminderEngine 不拆分、Setup 归属哪层、Intelligence/Testing
+ *   为什么留空）的完整理由。
  *
- * 12_QueryEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
- * 02_EventBus.gs → 01_SecureConfig.gs (getKey('SPREADSHEET_ID'))
+ * ── 1_Foundation ──────────────────────────────────────────
+ *
+ * 10_SecureConfig.gs 〔原 01_SecureConfig.gs〕— Configuration。
+ *   本地副本，逐字未改。
+ * 11_Setup.gs 〔原 15_Setup.gs〕— Configuration（+部分 Testing/Validation，
+ *   未物理拆分，见 ADR-001 判断5）。
+ *   ⚠️ 你上传的 15_Setup.txt 内容实际是 12_QueryEngine.txt 的复制，不是
+ *   Setup 该有的 createTriggers/runDiagnostics。这份是我按 File_Map 旧版
+ *   本 + README.md 的文字描述反推重建的，不是你的原始代码，需要你核对/
+ *   替换，见 00_Project_State.gs「已知问题」。
+ *
+ * ── 2_Runtime ─────────────────────────────────────────────
+ *
+ * 20_EventBus.gs 〔原 02_EventBus.gs〕— Event。
+ *   精简版：只发 REMINDER_SENT，不需要本地 ProjectionEngine
+ *   （EventBus.publish() 内部的 "typeof ProjectionEngine !== 'undefined'"
+ *   检查会安全跳过）。逐字未改。
+ * 21_SheetUtils.gs 〔原 05_SheetUtils.gs〕— Projection（主：upsertRowByKey_/
+ *   deleteRowByKey_/batchUpsertRowsByKey_）+ Decision 支撑（isOverdue_/
+ *   parseDueDate_，供 ReminderEngine 用）+ 跨层通用工具（round1_/round2_/
+ *   shallowCopy_/_cleanTitle_，历史上就是为了反重复实现才统一搬到这里）。
+ *   横跨多个子分类但没有物理拆分，理由见 ADR-001 判断6。逐字未改。
+ * 22_QueryEngine.gs 〔原 12_QueryEngine.gs〕— Query。
+ *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逐字未改。
+ * 25_ReminderEngine.gs 〔原 92_ReminderEngine.gs〕— Decision
+ *   （_shouldRemind/_isOverdue/_hoursUntilDue）+ Execution
+ *   （checkReminders/_buildReminder/_sendReminder/_updateReminderCount，
+ *   后者会触发 Runtime/Event 和 Runtime/Projection）。横跨两个子分类但
+ *   没有物理拆分，理由见 ADR-001 判断7。
+ *   【2026-07-06 修改】_shouldRemind 修复 HIGH RISK 2：新增
+ *   REMINDER_ADVANCE_HOURS 常量 + _hoursUntilDue 辅助函数，未逾期且距
+ *   due_date 超过提前量时直接不提醒。里程类 due_date 不受影响。
+ *   2026-07-03 拆分时的 2 处改动（getPendingTasks()→QueryEngine.
+ *   getPendingTasks()；_materializeTaskRow_(...)→upsertRowByKey_(...)）
+ *   继续保留。
+ *
+ * ── 3_Intelligence ────────────────────────────────────────
+ *   （暂无文件，见 3_Intelligence/_RESERVED.txt）
+ *
+ * ── 4_Integration ─────────────────────────────────────────
+ *
+ * 40_Output.gs 〔原 03_Output.gs〕— APIs / External Systems（Telegram Bot
+ *   API，本项目发消息的唯一出口）。逐字未改。
+ *
+ * ── 5_Testing ─────────────────────────────────────────────
+ *   （暂无文件，见 5_Testing/_RESERVED.txt）
+ */
+
+// ============================================================
+// 二、模块关系（文件名已更新为新结构）
+// ============================================================
+
+/**
+ * 2_Runtime/25_ReminderEngine.gs
+ *   → QueryEngine.getPendingTasks()                 [2_Runtime/22_QueryEngine.gs]
+ *   → isOverdue_ / parseDueDate_ / upsertRowByKey_   [2_Runtime/21_SheetUtils.gs]
+ *   → Output.sendMessage                             [4_Integration/40_Output.gs]
+ *   → EventBus.publish                                [2_Runtime/20_EventBus.gs]
+ *
+ * 2_Runtime/22_QueryEngine.gs
+ *   → getSheet_ / getHeaderMap_                       [2_Runtime/21_SheetUtils.gs]
+ *
+ * 2_Runtime/20_EventBus.gs
+ *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]
+ *
+ * 2_Runtime/21_SheetUtils.gs
+ *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]
+ *
+ * 1_Foundation/11_Setup.gs（⚠️待确认版本）
+ *   → QueryEngine.getPendingTasks()                   [2_Runtime/22_QueryEngine.gs]
+ *   → Output.sendMessage                              [4_Integration/40_Output.gs]
+ *   → SecureConfig.getKey(...)                        [1_Foundation/10_SecureConfig.gs]
  *
  * 本项目不依赖 Personal AI Core / Productivity OS 的任何代码，只是读写
  * 同一张共享 Spreadsheet 里 Productivity OS 拥有的 Tasks 表（读全部字段+
  * 写 reminder_count/last_reminder_at 两个字段）和共享的 Events 表
- * （只追加，不读不改别人写的行）。
+ * （只追加，不读不改别人写的行）。这一点 blueprint 重组前后没有变化。
+ *
+ * ⚠️ 提醒：GAS 是扁平命名空间，没有 import/require——上面这些箭头描述的是
+ * "谁在自己函数体里调用谁的全局函数/变量"，不是文件间的强依赖关系；把
+ * 所有文件贴进同一个 Apps Script 项目后，调用顺序不受物理文件名/资料夹
+ * 影响。资料夹结构（0_Governance ... 5_Testing）只是这份交付和以后看
+ * repo 时用来对应 blueprint 的组织方式，贴进 Apps Script 编辑器时全部会
+ * 变成一份扁平文件列表，只看文件名，不认目录，详见 README.md。
  */

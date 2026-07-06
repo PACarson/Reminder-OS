@@ -3,7 +3,8 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — 修复 HIGH RISK 2；按 Domain OS Blueprint
+ * 重组全部文件；发现并记录 15_Setup.gs 内容不符问题。
  */
 
 // ============================================================
@@ -15,6 +16,19 @@
  *   只改了 2 处（getPendingTasks() → QueryEngine.getPendingTasks()；
  *   _materializeTaskRow_(...) → upsertRowByKey_('Tasks', ...)，因为原来
  *   调的那两个函数所在的文件不在本项目了），判断逻辑逐字未改。
+ *
+ * - 2026-07-06：修复 HIGH RISK 2。_shouldRemind 新增 _hoursUntilDue 判断+
+ *   REMINDER_ADVANCE_HOURS 常量（默认 72 小时，Claude 选的默认值，未逾期
+ *   且距 due_date 超过这个提前量时直接不提醒）；里程类 due_date（'40000km'）
+ *   维持原行为不受影响，等 RiderConnector 接好再处理。REMINDER_INTERVAL_HOURS
+ *   数值未变。详见 2_Runtime/25_ReminderEngine.gs 的 "2026-07-06 bugfix" 注释。
+ *
+ * - 2026-07-06：全部文件按 Domain OS Blueprint（Governance/Foundation/
+ *   Runtime/Intelligence/Integration/Testing）重新组织到对应文件夹+新编号，
+ *   00_File_Map.gs 全面重写，00_Project_Constitution.gs 新增 P5，新增
+ *   00_ADR_001_Domain_OS_Blueprint_Adoption.gs 记录采用理由和具体判断。
+ *   GAS 是扁平命名空间、没有 import，重命名/挪动文件不影响任何调用关系，
+ *   这次改动纯粹是物理位置+文件名+文档，不涉及任何函数签名或调用方式变化。
  */
 
 // ============================================================
@@ -26,23 +40,28 @@
  */
 
 // ============================================================
-// 三、已知Bug
+// 三、已知问题
 // ============================================================
 
 /**
- * 从 Personal AI Core 带过来、还没修的（拆分时特意不夹带修复）：
+ * - 【2026-07-06 新发现，待你确认】你这次上传的 15_Setup.txt，文件内容
+ *   实际是 12_QueryEngine.txt 的完整复制（文件头注释都写着
+ *   "12_QueryEngine.gs"），不是 00_File_Map.gs / README.md 描述的
+ *   createTriggers/runDiagnostics。大概率是打包这个 zip 时的复制粘贴
+ *   失误，不是你 Apps Script 项目里的真实状态。
+ *   我按 File_Map/README 的文字描述反推重建了一份放在
+ *   1_Foundation/11_Setup.gs，行为上是"挂 checkReminders 每小时触发器"+
+ *   "验证 Tasks 表可读+发一条测试 Telegram 消息"，但具体实现细节
+ *   （有没有去重逻辑、诊断输出格式等）是我猜的，不是你的原始代码。
+ *   请对照你 Apps Script 编辑器里真实的 15_Setup.gs，不一致的话把真实
+ *   内容发我替换掉这份重建版。
  *
- * - HIGH RISK 2（2026-07-01 外部审计）：_shouldRemind 只判断是否逾期
- *   （_isOverdue）和距上次提醒是否超过间隔小时数，完全没有校验当前时间
- *   是否已经接近 due_date。任务一旦是 PENDING，哪怕 due_date 在一个月后，
- *   也会立刻按优先级对应的间隔（比如 MEDIUM=12小时）开始高频提醒。
- *   修复方向（还没做）：引入"提前多久开始提醒"的判断——距 due_date 超过
- *   这个提前量、且未逾期时，_shouldRemind 直接返回 false。
- *
- * - "接V3改EventBus.publish"这条旧 TODO：核实后发现代码其实已经在调
- *   EventBus.publish('REMINDER_SENT',...)了，这条 TODO 可能是旧记录跟
- *   代码脱节（drift），具体原意不确定，如果 Carson 记得当时想解决的是
- *   什么，可以更新这里。
+ * - "接V3改EventBus.publish"这条旧 TODO：这次核实，代码（现
+ *   2_Runtime/25_ReminderEngine.gs 的 _updateReminderCount）确实已经在调
+ *   EventBus.publish('REMINDER_SENT', ...)。跟这条笔记本身的猜测一致——
+ *   大概率是旧记录跟代码脱节（drift），不是真的还有未解决的部分。
+ *   具体原意我这边没法进一步确认，如果 Carson 记得当时想解决的是什么、
+ *   现在代码没覆盖到，可以更新/删掉这一条；不然可以考虑直接清掉。
  */
 
 // ============================================================
@@ -50,11 +69,29 @@
 // ============================================================
 
 /**
- * 优先级 P1（建议先做，是个真实存在、会影响体验的 bug）：
- *   1. 修 HIGH RISK 2（见上）。
+ * 优先级 P1（建议先做）：
+ *   1. 确认/替换 1_Foundation/11_Setup.gs（见上「已知问题」）——这个不
+ *      确认，项目的触发器挂载和部署自检就没有可信版本。
+ *
+ * 优先级 P2（这次改动留下的判断，建议过一遍）：
+ *   2. REMINDER_ADVANCE_HOURS 默认给了 72 小时（3天），是 Claude 选的，
+ *      不是从你的文档/代码反推出来的既定值——按你实际提醒习惯调整这个
+ *      数字即可，不影响判断逻辑本身。
+ *   3. 如果想要「CRITICAL 提前更久开始提醒、LOW 提前更短」这种按优先级
+ *      分开的提前量（而不是现在的单一全局值），是个可以照
+ *      REMINDER_INTERVAL_HOURS 结构做的小改动，这次按 bug 报告里描述的
+ *      最小范围先没做（P6，不做额外扩展）。
+ *   4. 这次 blueprint 重组里，21_SheetUtils.gs 和 25_ReminderEngine.gs
+ *      都是横跨多个 blueprint 子分类、没有拆分成更小的文件——理由和具体
+ *      考虑见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs，如果你希望拆得
+ *      更细，可以再单独排。
+ *   5. Domain OS Blueprint 是跨项目的平台级约定，权威定义按惯例应该也记
+ *      一份在 Personal AI Core 的 00_Project_Constitution.gs——这次没有
+ *      该项目的文件，只更新了 Reminder OS 自己这份，需要的话把 Core 项目
+ *      文件也发我，我再同步过去。
  *
  * 优先级 P3（架构演进）：
- *   2. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
+ *   6. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
  */
