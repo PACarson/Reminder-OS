@@ -1,199 +1,510 @@
 /**
  * 00_File_Map.gs
- * Reminder OS v1.0 — 文件地图
+ * JARVIS CORE v3.1 — 文件地图
  *
- * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
- * 已替换为你提供的真实代码；修复第一轮外部审计对 25_ReminderEngine.gs /
- * 20_EventBus.gs 的 6 项发现；评估 Reminder OS V2 构想并规划分阶段
- * Roadmap；Phase A（Temporal Engine）完成 Contract 设计（A0）+ 实现
- * （A1），5_Testing 层第一次有内容；修复第二轮外部审计对
- * 25_ReminderEngine.gs/20_EventBus.gs/21_SheetUtils.gs 的 6 项发现，
- * 并发现修复一个既有的更严重 bug（last_reminder_at 从未写入）。完整
- * 决策依据见 00_ADR_001 到 00_ADR_004（见下）。
+ * 本文件只放两类内容：文件职责 / 模块关系。
+ * 不放进度、不放原则 —— 那些在 00_Project_State.gs 和 00_Project_Constitution.gs。
+ *
+ * LAST_UPDATED: 2026-07-03 — 同步 Constitution 的 Platform 架构决议：
+ *   21_InventoryModule.gs / 22_InventoryIntentParser.gs 补注"目标归属"
+ *   （见下方各自条目内的 2026-07-03 备注）。本次未改动任何函数/依赖关系，
+ *   纯粹是治理层面的目标状态标注。
+ *   同日追加：Productivity OS / Reminder OS 物理拆分完成。06/13/20/92
+ *   四个文件的详细说明已移除（现在是别的项目的文件），改成"已移交"指针；
+ *   21/80 的调用点因为拆分加了 ProductivityOS./QueryEngine. 前缀，已同步
+ *   更新说明；07_StateEngine_TaskMetrics.gs 改名 07_IdentityEngine.gs 的
+ *   遗留问题（2026-07-01 LOW RISK 2）已解决。
+ *
+ * ⚠️ 2026-07-01 发现并修正的 doc/code drift：本文件此前把
+ * batchUpsertRowsByKey_ 的"调用方迁移"（11_ProjectionRebuilder.gs 实际切换
+ * 调用）和 rebuildActiveTasksProjection() 都标成了"v3.1已完成"，但核实实际
+ * 代码后发现这两处从未真正实现——05_SheetUtils.gs 的 batchUpsertRowsByKey_
+ * 函数本身确实存在且正确，但 11_ProjectionRebuilder.gs 里
+ * rebuildTasksProjection/rebuildInventoryProjection 当时仍在循环里调用
+ * 单行 upsertRowByKey_；rebuildActiveTasksProjection 函数当时根本不存在。
+ * 跟之前抓到的"ProjectionRebuilder停在v3.0基线、文档却按v3.1描述"是同一类
+ * 问题：文档记录了"计划要做的修复"，但没有等代码级确认就标成"已完成"。
+ * 这次已经在代码里把这两处补上（见下方对应条目），本文件的描述现在跟代码
+ * 一致。以后任何"v3.1/v3.2 新增/修复"的表述，都是先核实代码后才写的。
+ *
+ * LAST_UPDATED: 2026-07-08 — 新增 08_Connector/ 目录（6个文件）：
+ *   ConnectorResponse.gs / ConnectorTypes.gs / ConnectorRegistry.gs /
+ *   ProductivityConnector.gs / ReminderConnector.gs / README.gs。详细
+ *   职责见下方"一、文件职责"新增小节，依赖图见下方"二、模块关系"新增
+ *   小节。80_RiderConnector.gs / 12_QueryEngine.gs / 02_EventBus.gs /
+ *   05_SheetUtils.gs 本次均未修改，只是被新文件以只读方式依赖。
  */
 
 // ============================================================
-// 一、按 blueprint 层级列出的文件
+// 一、文件职责
 // ============================================================
 
 /**
- * ── 0_Governance ──────────────────────────────────────────
+ * 治理文档（00_*）
+ * ----------------------------------------------------------
+ * 00_Project_Constitution.gs   原则 / 架构规则 / Coding Rules，几乎不变
+ * 00_Project_State.gs          已完成 / 进行中 / 已知Bug / 下一步，每次变更可能要更新
+ * 00_File_Map.gs               本文件，文件职责 + 模块关系，结构变了才更新
  *
- * 00_Project_Constitution.gs — 项目宪法。P1-P2 未变，P3 更新为批量写入
- *   机制，P4 记录 HIGH RISK 2（上一轮）已修复，P5 记录 Domain OS Blueprint
- *   采用，P6 记录 Telegram callback 跨项目契约，新增 P7 长期方向（一句话
- *   指向 ADR-003，不在 Constitution 里罗列细节）。
- * 00_Project_State.gs — 项目状态快照。本次更新：新增本轮 6 项审计修复的
- *   完成记录，「已知问题」新增 MEDIUM RISK 1（持续存在、非单边可修复），
- *   新增「长期方向」一节（Current/Future/Status 三行快照，指向 ADR-003）。
- * 00_File_Map.gs — 本文件。
- * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs — 记录采用 blueprint 的
- *   背景、号段分配、文件映射表、以及几个关键判断（为什么
- *   SheetUtils/ReminderEngine 不拆分、Setup 归属哪层、Intelligence/Testing
- *   为什么留空）的完整理由。
- * 00_ADR_002_ReminderEngine_Audit_Fixes.gs — 记录外部审计对
- *   ReminderEngine/EventBus 的 6 项发现（HIGH/MEDIUM/LOW 各两条）逐条
- *   核实+修复的过程，包括对 MEDIUM RISK 2 审计原始建议的修正（GAS 触发器
- *   不能绑定到 IIFE 属性）和 MEDIUM RISK 1 为什么只能"文档化+诊断"而不是
- *   "消除"。
- * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs — 评估"Reminder OS V2"
- *   构想（7个引擎+schema扩展+Intelligence预留+8个Domain OS集成+11种
- *   事件类型），好的部分/担心的部分/建议范围；Architecture Roadmap
- *   （Phase A→F，按"确定性"分层——接口/草图/仅目的三种颗粒度）；
- *   Progression Rule（roadmap 不是 backlog，不因为列在上面就该做）；
- *   各 phase 的 Exit Criteria。STATUS: Proposed，范围待 Carson 拍板。
- * 00_ADR_004_Temporal_Engine_Design.gs — Phase A 拆成 A0（这份文档：
- *   Contract 设计）+ A1（实现，见 1_Foundation/12_TemporalEngine.gs）。
- *   定义 RuleSpec/Schedule Model 长什么样、四个函数的精确签名、
- *   Immutable/Pure Function/Dependency Rule 等约束、边界情况决定（比如
- *   monthly day_of_month 溢出时"跳过"而非"clamp"、every_n_days 的
- *   start_date 锚点）、V1 支持哪些规则形状/明确不支持哪些、Test Matrix。
- *   STATUS: Accepted，Gate Review 已过，A1 已实现并通过全部测试。
+ * 核心基础设施
+ * ----------------------------------------------------------
+ * 01_SecureConfig.gs   PropertiesService 包装，setKey / getKey / deleteKey / listKeys
  *
- * ── 1_Foundation ──────────────────────────────────────────
+ * 02_EventBus.gs  【v3.1 修改】
+ *   Events 表唯一写入口。publish / getAllEvents / getEventsByType。
+ *   v3.0：publish() 第5参数identity（可选）→ 执行内去重缓存_inExecIdentityCache_；
+ *         写完Event后同步调ProjectionEngine.dispatch(event)。
+ *   v3.1 新增：_alertAdminProjectionFailure_()——Projection失败时不再只写
+ *   Logger日志，主动通过Output.sendMessage向TELEGRAM_CHAT_ID推送告警
+ *   （HIGH RISK 3修复，包try/catch，告警本身失败不影响publish()已成功
+ *   写入Event的事实）。
  *
- * 10_SecureConfig.gs 〔原 01_SecureConfig.gs〕— Configuration。
- *   本地副本，逐字未改。
- * 11_Setup.gs 〔原 15_Setup.gs〕— Configuration（+部分 Testing/Validation，
- *   未物理拆分，见 ADR-001 判断5）。2026-07-06 收到真实代码后已替换掉
- *   最初的反推重建版；同日稍晚 runDiagnostics() 新增 Telegram webhook
- *   可达性检查（MEDIUM RISK 1 关联，见 ADR-002）。createTriggers() 逐字
- *   未改。
- * 12_TemporalEngine.gs — 【新增，Phase A / A1】通用日期规则计算引擎，
- *   Contract 见 00_ADR_004。不知道"提醒"，不调用本项目任何其他文件——
- *   刻意保持零依赖，方便以后整份文件复制到 Finance OS/Vehicle OS 等
- *   全新项目。Pure Function（无 IO/无 Logger/不读当前时间），Schedule
- *   Model 不可变。支持 daily/weekly/monthly/yearly/every_n_days 五种
- *   规则，V1 明确不支持的形状见 ADR-004。
+ * 03_Output.gs   Telegram 消息唯一发送口，sendMessage(chatId, text, keyboard)
  *
- * ── 2_Runtime ─────────────────────────────────────────────
+ * 04_Main.gs  【v3.1 修改】
+ *   doPost() webhook 入口，_handleMessage_ 按顺序试：
+ *     /help 全局短路 → handleTaskIntent → handleInventoryIntent →
+ *     handleInsightIntent → 兜底帮助文本
+ *     callback_query（task_done: / task_snooze:）单独走 _handleCallback_
+ *   v3.0：doPost 所有 return 用 HtmlService.createHtmlOutput('ok')（302修复）
+ *   v3.1 新增：_handleMessage_ 最前面加 /help|帮助|命令|指南|菜单|h 全局短路，
+ *   早于任何意图解析器直接回帮助文本，修复"/help被误判成建任务"Bug
+ *   （双重保险第一层，第二层在06_TaskIntentParser.gs）。
+ *   _buildHelpText_() 独立函数，/help 和兜底提示共用，新增 /archive 行。
  *
- * 20_EventBus.gs 〔原 02_EventBus.gs〕— Event。
- *   精简版：只发 REMINDER_SENT，不需要本地 ProjectionEngine
- *   （EventBus.publish() 内部的 "typeof ProjectionEngine !== 'undefined'"
- *   检查会安全跳过）。【2026-07-06 修改】_sheet_() 新增惰性缓存
- *   （第一轮 LOW RISK 2），同一次执行内不再重复 openById；公开 API 和
- *   行为不变。第二轮审计的 MEDIUM RISK 1（并发实例下内存去重失效）
- *   核实属实但决定不修，理由见 00_Project_State.gs「已知问题」。
- * 21_SheetUtils.gs 〔原 05_SheetUtils.gs〕— Projection（主：upsertRowByKey_/
- *   deleteRowByKey_/batchUpsertRowsByKey_）+ Decision 支撑（isOverdue_/
- *   parseDueDate_，供 ReminderEngine 用）+ 跨层通用工具（round1_/round2_/
- *   shallowCopy_/_cleanTitle_，历史上就是为了反重复实现才统一搬到这里）。
- *   横跨多个子分类但没有物理拆分，理由见 ADR-001 判断6。
- *   【2026-07-06 第二轮审计，LOW RISK 1】包进 IIFE（SheetUtils 模块），
- *   是最后一个完成这项改造的"引擎风格"文件，对外暴露 SheetUtils.xxx
- *   共11个函数，调用方（22_QueryEngine.gs/25_ReminderEngine.gs）同步
- *   改成命名空间形式。函数内部逻辑本身逐字未改。第二轮 MEDIUM RISK 2
- *   （单一共享 Spreadsheet 的容量/隔离顾虑）核实属实但决定不修，理由见
- *   00_Project_State.gs「已知问题」。
- * 22_QueryEngine.gs 〔原 12_QueryEngine.gs〕— Query。
- *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逻辑
- *   逐字未改，【2026-07-06】调用 SheetUtils 的方式同步改成命名空间形式
- *   （SheetUtils.getSheet_/SheetUtils.getHeaderMap_）。
- * 25_ReminderEngine.gs 〔原 92_ReminderEngine.gs〕— Decision
- *   （_shouldRemind/_isOverdue/_hoursUntilDue）+ Execution
- *   （checkReminders/_buildReminder/_sendReminder/_recordReminderSent，
- *   后者会触发 Runtime/Event 和 Runtime/Projection）。横跨两个子分类但
- *   没有物理拆分，理由见 ADR-001 判断7。
- *   【2026-07-06 早些时候】_shouldRemind 修复上一轮 HIGH RISK 2：新增
- *   REMINDER_ADVANCE_HOURS 常量 + _hoursUntilDue 辅助函数，未逾期且距
- *   due_date 超过提前量时直接不提醒。里程类 due_date 不受影响。
- *   【2026-07-06 同日稍晚，第一轮外部审计6项发现，见 ADR-002】结构性
- *   重写：全部逻辑包进 IIFE（ReminderEngine 模块），只保留 checkReminders
- *   一个全局薄封装函数供 GAS 触发器绑定（MEDIUM RISK 2）；checkReminders
- *   循环内不再逐任务 upsertRowByKey_，改成收集后批量写（HIGH RISK 1）；
- *   _sendReminder 之间新增 Utilities.sleep(1000) 节流（HIGH RISK 2）；
- *   lock.waitLock 从 5000ms 延长到 30000ms（LOW RISK 1）；
- *   _updateReminderCount 改名 _recordReminderSent。
- *   【2026-07-06 第二轮外部审计，见 ADR-002「第二轮」】checkReminders
- *   再次重构：forEach 改 for 循环 + 时间预算机制（接近6分钟上限提前
- *   中断但保证已处理部分落盘，HIGH RISK 1新）；_sendReminder 返回发送
- *   结果，只有确认成功才更新状态（HIGH RISK 2新）；单任务 try/catch
- *   加固；调用 SheetUtils 的方式改成命名空间形式（isOverdue_→
- *   SheetUtils.isOverdue_ 等，LOW RISK 1新）。
- *   ⚠️ 同批顺带修了一个更严重的既有 bug（不在任何审计报告里）：
- *   _recordReminderSent 之前从未设置 task.last_reminder_at，导致
- *   REMINDER_INTERVAL_HOURS 的分级提醒间隔从未生效，所有任务每小时都
- *   会重发。已修复并补充回归测试验证。
- *   2026-07-03 拆分时的判断逻辑本身、发消息内容、按钮结构均未变。
+ * 05_SheetUtils.gs  【v3.1 修改】
+ *   只给 Tasks / Inventory / ActiveTasks / ArchiveTasks 等派生视图用；
+ *   禁止碰 Events 表。
+ *   原有公开：getSheet_ / getHeaderMap_ / upsertRowByKey_ /
+ *             parseDueDate_ / isOverdue_ / round1_ / round2_
+ *   v3.1 新增公开：
+ *     - deleteRowByKey_(sheetName, keyHeader, keyValue) → boolean
+ *       ActiveTasks需要"任务完成后整行物理删除"，upsertRowByKey_没有删除
+ *       语义，新增这个配对函数。
+ *     - batchUpsertRowsByKey_(sheetName, keyHeader, rowDataObjArray)
+ *       → {updated, appended}
+ *       v3.1新增这个函数本身（一次性读全表→内存合并→最多2次setValues()写回，
+ *       I/O次数固定≤3次）。⚠️drift修正：11_ProjectionRebuilder.gs 真正把
+ *       rebuildTasksProjection/rebuildInventoryProjection的调用从循环单行
+ *       upsertRowByKey_切换成这个函数，是v3.2（2026-07-01）才做的——v3.1
+ *       只做了"新增工具函数"，没有同步完成"调用方迁移"，本文件当时错误地把
+ *       两者都记成了v3.1已完成，见文件头drift说明。
+ *     - shallowCopy_(obj)：MEDIUM RISK 1修复，从20_ProductivityModule.gs
+ *       搬来（21原本是shallowCopyInv_，逻辑相同，现在统一调这份）
+ *     - _cleanTitle_(text)：MEDIUM RISK 1修复，从06_TaskIntentParser.gs
+ *       搬来（22原本依赖06的全局声明，现在两边都改调05这份）
  *
- * ── 3_Intelligence ────────────────────────────────────────
- *   （暂无文件，见 3_Intelligence/_RESERVED.txt）
+ * 09_TemporalParser.gs  【v3.2 修改】
+ *   中文相对日期解析（extractDateTime）+ recurrence_rule 解析。
+ *   被 06 / 22 共用，不依赖任何业务模块。
+ *   ⚠️ 文件编号注意：09_IdempotencyManager.gs 与本文件同前缀，GAS 可共存（见 State）
+ *   v3.2 新增：computeNextDueDateFromLabel(prevDueDateStr, recurringLabel)
+ *     → string。给20_ProductivityModule.completeTask()用——recurring任务
+ *     完成时，用这个算出下一次的due_date。范围只到interval=1的四种legacy
+ *     字符串（Daily/Weekly/Monthly/Yearly），跟TASK_RECURRING现在能持久化
+ *     的范围一致。这是本文件第一次被20依赖（之前只有06/22共用），见下方
+ *     依赖图新增边。
  *
- * ── 4_Integration ─────────────────────────────────────────
+ * 13_ActiveTasksEngine.gs — 【2026-07-03 已移交】现在是 Productivity OS
+ *   项目的文件（ActiveTasks/ArchiveTasks 冷归档+历史查询）。本项目
+ *   不再包含这个文件，详细函数说明见 Productivity OS 项目自己的
+ *   00_File_Map.gs。
  *
- * 40_Output.gs 〔原 03_Output.gs〕— APIs / External Systems（Telegram Bot
- *   API，本项目发消息的唯一出口）。逐字未改。
+ * 15_Setup.gs  【v3.2 修改】
+ *   setupSheets / registerWebhook / checkWebhookStatus / deleteWebhook /
+ *   createTriggers / dailyInventoryCheck / setupAll / runDiagnostics /
+ *   repairSheetHeaders
+ *   v3.1 变更：
+ *     - setupSheets() 新增建 ActiveTasks / ArchiveTasks 两张表（已含完整
+ *       表头，含identity/archived_at列，新表不走migrate路径）
+ *     - createTriggers() 新增挂 triggerDailyArchive（每天凌晨2点），跟其余
+ *       3个触发器用同一套"先清旧的同名触发器再建新的"幂等模式统一管理
+ *     - repairSheetHeaders() / runDiagnostics() 同步纳入 ActiveTasks/ArchiveTasks
+ *     - runDiagnostics() 新增一段 /help 和"我的任务"路由的快速校验
+ *   v3.2 变更（MEDIUM RISK 3修复，外部审计，核实属实后采纳）：
+ *     - setupSheets() 的 Tasks/Inventory 初始表头直接加入 identity/archived
+ *       （Tasks）、identity/status（Inventory）——之前新用户只跑
+ *       setupSheets()不跑migrateAddIdentityColumns()的话，去重引擎会因为
+ *       找不到identity列静默跳过去重。
+ *     - migrateAddIdentityColumns()（11_ProjectionRebuilder.gs）连带修复：
+ *       之前从未真正给Tasks加过archived列，导致老部署冷归档每天重复搬运
+ *       同一批任务，见该文件条目。
+ *     - repairSheetHeaders() 的硬编码表头列表同步加上这些新列，保持跟
+ *       setupSheets()一致。
  *
- * ── 5_Testing ─────────────────────────────────────────────
+ * V3 基础设施（CQRS + Idempotency Layer）
+ * ----------------------------------------------------------
+ * 07_IdentityEngine.gs
+ *   生成确定性 SHA-256 业务身份。纯函数，零外部依赖。
+ *   generateTaskIdentity(chatId, title, dueDate, repeatRule, priority, category)
+ *   generateInventoryIdentity(chatId, itemName, unit)
+ *   generateReminderIdentity(chatId, taskId, scheduledAt)
+ *   normalizeTitle / normalizeWhitespace / normalizeCase / normalizeUnicode
  *
- * 50_TemporalEngine_Tests.gs — 【新增】这个 blueprint 层第一次有内容。
- *   覆盖 ADR-004 Test Matrix 的全部用例（daily/weekly/monthly/yearly/
- *   every_n_days 的正常情况+边界情况、闰年/世纪年、fromTime/untilTime
- *   精确命中、parseRule 非法输入、Immutable 验证、Reminder/Finance/
- *   Vehicle 三种视角的消费者验证）。GAS 没有现成测试框架，跟
- *   runDiagnostics() 一样的风格——手动跑、Logger.log 输出 PASS/FAIL。
- *   之前这里空的时候有 _RESERVED.txt 说明原因，现在有真实内容了，那份
- *   文件已经删除，不需要再带进 Apps Script 项目。
+ * 08_DeduplicationEngine.gs
+ *   读 Tasks / Inventory Sheet（Read Model），判断业务对象是否已存在。
+ *   findExistingTask(identity) → 只有 PENDING 才算重复
+ *   findExistingInventory(identity) → CONSUMED 的不算存在
+ *   findPendingTask / exists
+ *
+ * 09_IdempotencyManager.gs  【v3.1 修改】
+ *   所有 Create 操作的唯一入口（Exactly-Once Semantics）。
+ *   禁止任何模块直接调 EventBus.publish('TASK_CREATED') 或 ('ITEM_ADDED')。
+ *   createTaskIfNotExists(title, meta, chatId) → { task, created: bool }
+ *   createInventoryIfNotExists(name, qty, meta, chatId) → { item, created: bool }
+ *   createReminderIfNotExists(chatId, taskId, scheduledAt) → 预留
+ *   内部调用 _createTaskDirect_ / _createInventoryDirect_ / restockItem（20/21模块的全局函数）
+ *   v3.1 新增（HIGH RISK 1修复）：createTaskIfNotExists/createInventoryIfNotExists
+ *   整个"读-校验-写"过程用 LockService.getScriptLock()（waitLock 10s，finally
+ *   释放）包住，解决并发Webhook下幂等失效问题。
+ *   ⚠️ 此锁范围内会调用 21_InventoryModule.restockItem——restockItem内部
+ *   绝不能再获取同一把锁（GAS LockService不可重入，会死锁）。
+ *   ⚠️ 文件编号注意：09_TemporalParser.gs 与本文件同前缀，GAS 可共存（见 State）
+ *
+ * 10_ProjectionEngine.gs  【v3.1 修改】
+ *   EventBus 每次 publish 后同步调用 dispatch(event)，增量更新 Read Model。
+ *   O(1) 更新，不重放 Events。失败不抛错（日志记录+v3.1新增告警，可运行
+ *   Rebuild 修复）。
+ *   Projectors：projectTaskCreated_ / projectTaskCompleted_ / projectTaskCancelled_ /
+ *               projectReminderSent_ / projectInventoryAdded_ / projectInventoryRestocked_ /
+ *               projectInventoryUsed_ / projectInventoryExpirySet_ /
+ *               projectItemLowStockLinked_ / projectItemExpiryLinked_ / projectInventoryRemoved_
+ *   v3.1 新增：projectTaskCreated_/Completed_/Cancelled_ 现在同步维护 ActiveTasks——
+ *     CREATED→upsert进ActiveTasks，COMPLETED/CANCELLED→deleteRowByKey_从
+ *     ActiveTasks删除（零延迟，不做定时批量重建，避免Tasks/ActiveTasks出现
+ *     不一致窗口）。ActiveTasks Sheet不存在时静默跳过（不影响Tasks主流程）。
+ *   ⚠️ projectReminderSent_ 目前是死代码（92_ReminderEngine.gs尚未接入这条
+ *   路径），暂未加锁，见00_Project_State.gs"已知Bug"。
+ *
+ * 11_ProjectionRebuilder.gs  【v3.2 修改】
+ *   从 Event Store 全量重建 Read Model。仅手动运维时调用。
+ *   migrateAddIdentityColumns() — 给 Tasks 加 identity+archived 列；给
+ *     Inventory 加 identity+status 列；给 ActiveTasks/ArchiveTasks 补全列
+ *     （安全网，正常应由setupSheets()直接建好完整表头）。⚠️drift修正：
+ *     archived列v3.1时文档就声称这个函数会加，但代码里从来只加了identity，
+ *     v3.2（2026-07-01）才真正补上——见15_Setup.gs文件头v3.2变更记录，
+ *     这个bug连带导致老部署的runDailyArchive每天重复归档同一批任务。
+ *   rebuildTasksProjection() / rebuildInventoryProjection() — 重建 Tasks /
+ *     Inventory Sheet。⚠️drift修正：改用batchUpsertRowsByKey_（O(N)→O(1)级
+ *     I/O）是v3.2才真正切换调用，v3.1只新增了工具函数本身，见本文件
+ *     05_SheetUtils.gs条目的drift说明。
+ *   rebuildActiveTasksProjection()— 【v3.2新增，非v3.1】清空ActiveTasks→
+ *     从Events推导全量状态→过滤PENDING/IN_PROGRESS/WAITING→批量写入。
+ *     ⚠️drift修正：v3.1文档就声称有这个函数，但代码里从未实现过，是这次
+ *     （2026-07-01）外部审计HIGH RISK 2才真正落地。
+ *   rebuildAllProjections()       — 一键重建 Tasks+Inventory+ActiveTasks
+ *   verifyProjection()            — 校验 Read Model 与 Events 是否一致，
+ *     v3.2新增调用 _verifyActiveTasksConsistency_ 做ActiveTasks一致性校验。
+ *     ⚠️drift修正：这个校验段名字v3.1时文档就写了，但函数从未真正存在过，
+ *     v3.2（2026-07-01）才补上。
+ *   compareProjectionWithEvents() / repairProjection()
+ *
+ * 12_QueryEngine.gs
+ *   所有 Telegram 读操作的唯一入口。永不重放 Events。O(n on Read Model)。
+ *   getPendingTasks(chatId) → task[]（与 v2 getPendingTasks 格式兼容）
+ *   getCompletedTasks / getTaskById
+ *   getInventory(chatId) → { item_id: item }（与 v2 deriveInventory 格式兼容）
+ *   findInventoryByName / getLowStockItems / getExpiringItems
+ *   ⚠️ v3.1后"我的任务"类查询已改走ActiveTasks Sheet（06_TaskIntentParser.gs
+ *   的_getActiveTasksForDisplay_，不经过本文件），getPendingTasks仍保留供
+ *   其他调用方（如checkLowStock兜底场景）使用。
+ *
+ * Read Model 新增列汇总（通过 migrateAddIdentityColumns 添加，v3.1更新）：
+ *   Tasks Sheet       → identity（SHA-256）/ archived（boolean，v3.1新增）
+ *   Inventory Sheet   → identity（SHA-256）/ status（ACTIVE/CONSUMED）
+ *   ActiveTasks Sheet → 【v3.1新增表】Tasks全部列 + identity（无archived列，
+ *                        因为这张表定义就是"只放未完成任务"）
+ *   ArchiveTasks Sheet→ 【v3.1新增表】Tasks全部列 + identity + archived_at
+ *
+ * Phase 1 业务模块
+ * ----------------------------------------------------------
+ * 06_TaskIntentParser.gs — 【2026-07-03 已移交】现在是 Productivity OS
+ *   项目的文件（parseTaskIntent/handleTaskIntent，Task 意图识别）。逐字
+ *   未改地搬过去，详细函数说明见 Productivity OS 项目自己的
+ *   00_File_Map.gs。
+ *
+ * 20_ProductivityModule.gs — 【2026-07-03 已移交】现在是 Productivity OS
+ *   项目的文件（createTask/completeTask/cancelTask/deriveFromEvent 等）。
+ *   逐字未改地搬过去，详细函数说明见 Productivity OS 项目自己的
+ *   00_File_Map.gs。本项目（Core）里所有原本调用这些函数的地方
+ *   （04_Main.gs / 21_InventoryModule.gs / 80_RiderConnector.gs /
+ *   15_Setup.gs 的诊断部分）已经改成 ProductivityOS.createTask(...) 这样
+ *   的 Library 调用，改动点见 README.md。
+ *
+ * 21_InventoryModule.gs  【v3.2 修改，2026-07-03 新增 Library 调用前缀】
+ *   新增 _createInventoryDirect_(name, qty, meta, chatId, identity) — 仅 IdempotencyManager 调用
+ *   addItem(name, qty, meta, chatId)          — 幂等路由层 → IdempotencyManager
+ *   restockItem                               — 被 IdempotencyManager 调用（item 已存在时，已在锁内）
+ *   useItem / setExpiry / removeItem          — useItem v3.1内部新增自行加锁
+ *   checkLowStock / checkExpiring             — 改用 QueryEngine.getInventory()，
+ *     创建关联任务的调用 2026-07-03 起改成 ProductivityOS.createTask()
+ *     （跨项目 Library 调用，见 README.md）
+ *   _findItemByName_                          — 改用 QueryEngine.findInventoryByName()
+ *   deriveInventory()                         — 保留，供 11_ProjectionRebuilder 使用
+ *   _materializeInventoryRow_ / rebuildInventorySheet_ — 保留，供 Rebuilder 和兜底使用
+ *   v3.1 变更：
+ *     - 删除全局 shallowCopyInv_ 声明，改调 05_SheetUtils.gs 的共用 shallowCopy_
+ *     - useItem() 内部新增 LockService.getScriptLock()（MEDIUM RISK 3修复：
+ *       这是唯一不经过IdempotencyManager的"读-改-写"热路径，之前完全无锁）
+ *     - restockItem 不加锁（唯一调用方IdempotencyManager已持锁，GAS锁不可
+ *       重入，文档注释明确标注此约束）
+ *     - INVENTORY_SHEET_NAME 收进 Object.freeze() 的 InventoryConfig
+ *       命名空间，原变量名保留为向后兼容别名（LOW RISK 2部分修复）
+ *   v3.2 变更（MEDIUM RISK 2修复，外部审计，核实属实后采纳）：
+ *     - useItem() 返回值从 undefined 变成 {success, error?}。之前
+ *       lock.waitLock(10000)超时抛出的异常没被捕获，会一路冒穿到doPost
+ *       变成裸错误信息发给用户；现在锁超时时返回{success:false,
+ *       error:'LOCK_TIMEOUT'}，不再向上抛异常。调用方
+ *       （22_InventoryIntentParser.gs）需要检查success字段。
+ *
+ * 22_InventoryIntentParser.gs  【v3.2 修改】
+ *   parseInventoryIntent / handleInventoryIntent，识别 INVENTORY_ADD / USE / LIST / EXPIRY。
+ *   v3.0：ADD → IdempotencyManager（+_buildRestockReply_）；
+ *         USE → QueryEngine.findInventoryByName；
+ *         LIST → QueryEngine.getInventory(chatId)；EXPIRY → QueryEngine.findInventoryByName
+ *   v3.1 变更：
+ *     - 🐛 修复 _extractQtyUnit_ 复合句解析错误（LOW RISK 1）："3个苹果和5个
+ *       香蕉"之前会把"和5个香蕉"整段误并入物品名。现在检测"和/还有/以及/跟+
+ *       数字"复合连接词并截断，通过truncatedTail告知调用方，ADD/USE回复文案
+ *       追加提示用户哪部分未被记录（不支持真正多物品拆分解析，引导分句发送）
+ *     - 删除全局 _cleanTitle_ 声明，改调 05_SheetUtils.gs 的共用版本
+ *       （依赖方向变化：之前隐式依赖06_TaskIntentParser.gs的全局声明，
+ *       现在两边都改调05_SheetUtils.gs）
+ *   v3.2 变更（MEDIUM RISK 2修复）：
+ *     - INVENTORY_USE 分支现在检查 useItem() 返回的 success 字段，锁超时时
+ *       回友好提示"系统繁忙，请稍后再发一次"，不再让异常炸穿到doPost
+ *
+ *   ⚠️ 目标归属备注【2026-07-03，只标注不改动，见 Constitution D2/D7】：
+ *     Inventory 已改判为 External System（独立开发中的 Inventory OS V2），
+ *     Personal AI Core 未来只保留一个 83_InventoryConnector.gs（单向
+ *     读取/触发，参照 80_RiderConnector.gs 的 Bridge 模式）。21/22 这两个
+ *     文件现在照常运作、照常按上面的版本记录维护，不受影响；等
+ *     Inventory OS V2 + Connector 就绪后才退役，退役时机见
+ *     00_Project_State.gs 下一步第16条，不是现在。
+ *
+ * 80_RiderConnector.gs
+ *   连接 Rider OS（独立项目 + 独立 Spreadsheet + 独立 Telegram chat）。
+ *   单向只读：Rider OS Sheet → Personal AI Core Task/Event。
+ *   createTask/completeTask 调用本身已幂等，创建/完成任务的语义没变；
+ *   2026-07-03 拆分后这几个调用点（含 getPendingTasks）改成
+ *   ProductivityOS.createTask() / ProductivityOS.completeTask() /
+ *   QueryEngine.getPendingTasks()（跨项目 Library 调用），纯粹是调用
+ *   写法变化，不是逻辑变化。
+ *
+ * 08_Connector/ 【2026-07-08 新增】统一 Connector Layer，见
+ *   Constitution D5(3)。六个文件：
+ *   - ConnectorResponse.gs   统一响应 DTO 工厂（success/failure），零依赖
+ *   - ConnectorTypes.gs      错误分类/ConnectorError信号异常/输入校验/
+ *                            ConnectorSupport.handle（每个 Connector 方法
+ *                            的标准执行骨架：计时+try-catch+分类+日志+
+ *                            组装响应）
+ *   - ConnectorRegistry.gs   注册表：register/get/has/list/invoke/
+ *                            healthCheckAll/capabilitiesAll，懒加载
+ *                            （registerCoreConnectors_ 在 get() 内部第
+ *                            一次被调用时才登记，不依赖 GAS 文件字母序
+ *                            加载顺序——理由同 05_SheetUtils.gs 文件头
+ *                            记录过的"后加载覆盖先加载"教训）
+ *   - ProductivityConnector.gs  Productivity OS 的唯一 Connector，
+ *                            走 Library 调用，九个标准方法全部有真实
+ *                            实现；DeleteTask 映射为 cancelTask（软删除），
+ *                            ReopenTask 因 Productivity OS 本身无此能力
+ *                            而诚实返回 BUSINESS_ERROR
+ *   - ReminderConnector.gs   Reminder OS 的唯一 Connector——Reminder OS
+ *                            没有 Library/webhook（见 D2/D5(2)），只能
+ *                            读同一张共享 Sheet；get/list/search/
+ *                            TodayReminders/UpcomingReminders/Statistics
+ *                            六个读操作是真实实现（经 Core 本地既有的
+ *                            QueryEngine/EventBus），CreateReminder/
+ *                            UpdateReminder/DeleteReminder/
+ *                            CompleteReminder/DismissReminder/
+ *                            SnoozeReminder/TriggerReminder 七个写/触发
+ *                            操作在 Reminder OS 当前版本下无对应后端，
+ *                            诚实返回 BUSINESS_ERROR（不是漏做，完整
+ *                            原因见 08_Connector/README.gs 五）
+ *   - README.gs              架构说明+调用示例+设计取舍，新窗口接手这
+ *                            个模块时应该先看这份，不是先看代码
+ *   范围说明：本次只新增这一层基础设施，04_Main.gs /
+ *   80_RiderConnector.gs / 21_InventoryModule.gs 现有直接调
+ *   ProductivityOS Library 的代码本次未改动，未迁移到走
+ *   ConnectorRegistry——是否/何时迁移见 00_Project_State.gs 下一步。
+ *
+ * 92_ReminderEngine.gs — 【2026-07-03 已移交】现在是 Reminder OS 独立
+ *   项目的文件（checkReminders/_shouldRemind/_buildReminder/
+ *   _sendReminder）。已知 HIGH RISK 2（_shouldRemind 缺 due_date 临近性
+ *   判断）原样带过去，没有顺手修，仍列在 00_Project_State.gs「已知Bug」。
+ *   详细函数说明见 Reminder OS 项目自己的 00_File_Map.gs。
+ *
+ * V4 洞察层（已实现，未受 V3/V3.1 影响）
+ * ----------------------------------------------------------
+ * 93_MemoryEngine.gs   只读 EventBus，算 completion_rate / risk_flags
+ * 94_BehaviorEngine.gs 依赖 93，算 delay_risk_tasks / optimal_time_windows
+ * 95_SuggestionEngine.gs 依赖 93+94，产出文字建议（不写 Events）
+ * 96_InsightRouter.gs  93/94/95 的 Telegram 入口 (/insights /memory 等)
+ *
+ * 07_IdentityEngine.gs — 【2026-07-03 已解决】物理文件名跟内部代码不一致
+ *   的问题（2026-07-01 LOW RISK 2）已在这次拆分中改正：物理文件名统一改成
+ *   07_IdentityEngine.gs，跟内部 `var IdentityEngine = ...` 一致，三个
+ *   项目（Core/Productivity OS/Reminder OS 各自需要的份）都用了这个
+ *   正确文件名。原来那条"待合并进 07_StateEngine.gs"的记录本身也是过时
+ *   的——文件内容一直就是 IdentityEngine，从来不是 StateEngine，这条
+ *   旧记录跟实际代码脱节，一并作废。
  */
 
 // ============================================================
-// 二、模块关系（文件名已更新为新结构）
+// 二、模块关系（依赖方向）
 // ============================================================
 
 /**
- * 2_Runtime/25_ReminderEngine.gs
- *   → QueryEngine.getPendingTasks()                 [2_Runtime/22_QueryEngine.gs]
- *   → SheetUtils.isOverdue_ / SheetUtils.parseDueDate_ /
- *     SheetUtils.batchUpsertRowsByKey_                [2_Runtime/21_SheetUtils.gs]
- *   → Output.sendMessage                             [4_Integration/40_Output.gs]
- *   → EventBus.publish                                [2_Runtime/20_EventBus.gs]
- *   （2026-07-06 第一轮起：批量落盘不再是逐任务 upsertRowByKey_，见
- *   ADR-002 第一轮 HIGH RISK 1；第二轮起 SheetUtils 调用改命名空间形式，
- *   见 ADR-002 第二轮 LOW RISK 1）
+ * V3.1 完整依赖图（箭头 = 依赖于；标【v3.1新增】的是本轮新增的依赖边）：
  *
- * 2_Runtime/22_QueryEngine.gs
- *   → SheetUtils.getSheet_ / SheetUtils.getHeaderMap_ [2_Runtime/21_SheetUtils.gs]
+ * ⚠️ 2026-07-03 拆分后：下面这张图里，只要出现 06/13/20/92 这几个文件名，
+ * 都表示"当年那个依赖关系确实存在过"，现在实际调用方式已经变成跨项目的
+ * Library 调用（Core → ProductivityOS.xxx()），Reminder OS 完全不在这张
+ * 依赖图里（它不依赖任何人，也没人依赖它，只是读写同一张共享表）。
+ * 具体每个调用点改成什么样子，见 README.md。
  *
- * 2_Runtime/20_EventBus.gs
- *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]
+ * 04_Main.gs (doPost)
+ *   → ProductivityOS.handleTaskIntent()  【原 06_TaskIntentParser.gs，
+ *     2026-07-03 起是跨项目 Library 调用】
+ *   → 22_InventoryIntentParser.gs  (handleInventoryIntent)
+ *   → 96_InsightRouter.gs  (handleInsightIntent)
+ *   → 03_Output.gs  (sendMessage)
+ *   → ProductivityOS.completeTask()  【原 20_ProductivityModule.gs，
+ *     callback_query 用，2026-07-03 起是跨项目 Library 调用】
+ *   （_buildHelpText_ 是本文件内部函数，不依赖其他模块）
  *
- * 2_Runtime/21_SheetUtils.gs
- *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]
+ * 06_TaskIntentParser.gs — 已移交 Productivity OS 项目，依赖图见那边的
+ *   00_File_Map.gs（在那个项目里，09/20/13/09_TemporalParser/05 全部是
+ *   本地文件，不再是"跨文件"依赖）。
  *
- * 1_Foundation/11_Setup.gs
- *   → QueryEngine.getPendingTasks()                   [2_Runtime/22_QueryEngine.gs]
- *   → Output.sendMessage                              [4_Integration/40_Output.gs]
- *   → SecureConfig.getKey(...)                        [1_Foundation/10_SecureConfig.gs]
- *   → SpreadsheetApp.openById(...).getSheetByName('Tasks')  [直接读，不经过 SheetUtils]
- *   → UrlFetchApp.fetch(...getWebhookInfo)            [Telegram Bot API，直接调用，
- *                                                       2026-07-06 新增，MEDIUM RISK 1
- *                                                       关联，见 ADR-002]
+ * 22_InventoryIntentParser.gs
+ *   → 09_IdempotencyManager.gs  (createInventoryIfNotExists)
+ *   → 12_QueryEngine.gs  (getInventory, findInventoryByName)
+ *   → 21_InventoryModule.gs  (useItem, setExpiry)
+ *   → 09_TemporalParser.gs  (extractDateTime)
+ *   → 05_SheetUtils.gs  (_cleanTitle_)  ← v3.1变更：之前隐式依赖06，现在改依赖05
  *
- * 1_Foundation/12_TemporalEngine.gs
- *   → （无）——刻意零依赖，只用 JS/GAS 内建能力，见 ADR-004 Dependency
- *   Rule。目前没有任何文件调用它（Phase B/Reminder Scheduler 还没做，
- *   见 00_ADR_003），只有 5_Testing/50_TemporalEngine_Tests.gs 在用。
+ * 09_IdempotencyManager.gs — 【2026-07-03 精简】只剩 Inventory/Reminder(预留)：
+ *   → 07_IdentityEngine.gs  (generateInventoryIdentity)
+ *   → 08_DeduplicationEngine.gs  (findExistingInventory)
+ *   → _createInventoryDirect_  (21_InventoryModule.gs 的全局函数)
+ *   → restockItem  (21_InventoryModule.gs 的全局函数)
+ *   → LockService（GAS内建）
+ *   （Task 部分 createTaskIfNotExists 已移交 Productivity OS 项目自己的
+ *   09_IdempotencyManager.gs）
  *
- * 本项目不依赖 Personal AI Core / Productivity OS 的任何代码，只是读写
- * 同一张共享 Spreadsheet 里 Productivity OS 拥有的 Tasks 表（读全部字段+
- * 写 reminder_count/last_reminder_at 两个字段）和共享的 Events 表
- * （只追加，不读不改别人写的行）。这一点 blueprint 重组前后没有变化。
+ * 08_DeduplicationEngine.gs
+ *   → 05_SheetUtils.gs  (getSheet_, getHeaderMap_)
  *
- * ⚠️ 提醒：GAS 是扁平命名空间，没有 import/require——上面这些箭头描述的是
- * "谁在自己函数体里调用谁的全局函数/变量"，不是文件间的强依赖关系；把
- * 所有文件贴进同一个 Apps Script 项目后，调用顺序不受物理文件名/资料夹
- * 影响。资料夹结构（0_Governance ... 5_Testing）只是这份交付和以后看
- * repo 时用来对应 blueprint 的组织方式，贴进 Apps Script 编辑器时全部会
- * 变成一份扁平文件列表，只看文件名，不认目录，详见 README.md。
+ * 07_IdentityEngine.gs  ← 零外部依赖
  *
- * 关于"Reminder OS V2"构想（7个新 Runtime 引擎等）：Phase A（Temporal
- * Engine）已完成 A0（Contract，00_ADR_004）+ A1（实现，
- * 1_Foundation/12_TemporalEngine.gs + 5_Testing/50_TemporalEngine_
- * Tests.gs，全部测试通过）。Phase B 及之后（Reminder Scheduler/Snooze/
- * Escalation/Dispatcher/Analytics）都还没有任何实现文件或占位——按
- * Progression Rule，不会因为 Phase A 做完就自动开始 Phase B，需要先有
- * 实际需求或使用经验支撑。范围和分阶段规划见
- * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs 和
- * 00_Project_State.gs「长期方向」。
+ * 10_ProjectionEngine.gs — 【2026-07-03 精简】只剩 Inventory 的 case：
+ *   → 05_SheetUtils.gs  (upsertRowByKey_, getSheet_, getHeaderMap_)
+ *   （Task/Reminder 的 case 已移交 Productivity OS 项目自己的
+ *   10_ProjectionEngine.gs）
+ *
+ * 11_ProjectionRebuilder.gs（手动运维工具）— 【2026-07-03 精简】只剩
+ *   Inventory 的重建函数：
+ *   → 02_EventBus.gs  (getAllEvents)
+ *   → 05_SheetUtils.gs  (getSheet_, getHeaderMap_, batchUpsertRowsByKey_)
+ *   → 07_IdentityEngine.gs  (generateInventoryIdentity)
+ *   → 21_InventoryModule.gs  (deriveInventory，用于 rebuildInventoryProjection)
+ *   （rebuildTasksProjection/rebuildActiveTasksProjection/verifyProjection/
+ *   compareProjectionWithEvents 依赖 20_ProductivityModule.deriveFromEvent，
+ *   那个文件已经不在本项目，这几个函数已从本项目的
+ *   11_ProjectionRebuilder.gs 删除——完整版仍在 Productivity OS 项目里）
+ *
+ * 12_QueryEngine.gs
+ *   → 05_SheetUtils.gs  (getSheet_, getHeaderMap_)
+ *   → parseDueDate_  (05_SheetUtils.gs，用于 getExpiringItems)
+ *   （getPendingTasks/getCompletedTasks/getTaskById 仍在本项目保留，因为
+ *   80_RiderConnector.gs 还需要调 QueryEngine.getPendingTasks；Productivity
+ *   OS 项目自己的 12_QueryEngine.gs 另外维护一份同样内容）
+ *
+ * 13_ActiveTasksEngine.gs — 已移交 Productivity OS 项目。
+ *
+ * 02_EventBus.gs
+ *   → 10_ProjectionEngine.gs  (dispatch，publish 后调用，现在只会分派到
+ *     Inventory 的 case，见上)
+ *   → 01_SecureConfig.gs  (getKey('TELEGRAM_CHAT_ID'))
+ *   → 03_Output.gs  (sendMessage，告警用)
+ *
+ * 20_ProductivityModule.gs — 已移交 Productivity OS 项目，依赖图见那边的
+ *   00_File_Map.gs。
+ *
+ * 21_InventoryModule.gs
+ *   → 09_IdempotencyManager.gs  (createInventoryIfNotExists，addItem 的入口)
+ *   → 12_QueryEngine.gs  (getInventory, findInventoryByName)
+ *   → ProductivityOS.createTask()  ← 2026-07-03 变更：原本调本项目内的
+ *     20_ProductivityModule.gs，现在是跨项目 Library 调用（checkLowStock/
+ *     checkExpiring 两处）
+ *   → 02_EventBus.gs  (publish, getAllEvents)
+ *   → 05_SheetUtils.gs  (upsertRowByKey_, shallowCopy_)
+ *   → LockService（GAS内建，useItem内部）
+ *
+ * 15_Setup.gs — 【2026-07-03 精简】不再挂 checkReminders/triggerDailyArchive
+ *   （分别移交 Reminder OS / Productivity OS 项目自己的 15_Setup.gs），
+ *   runDiagnostics() 里测 Task 相关的几行改成 ProductivityOS.xxx() /
+ *   QueryEngine.getPendingTasks() 调用（不再是裸调用）。
+ *
+ * 92_ReminderEngine.gs — 已移交 Reminder OS 项目，完全独立运作，依赖图见
+ *   那边的 00_File_Map.gs。
+ *
+ * 80_RiderConnector.gs
+ *   → ProductivityOS.createTask() / ProductivityOS.completeTask()  ←
+ *     2026-07-03 变更：原本调本项目内的 20_ProductivityModule.gs，现在是
+ *     跨项目 Library 调用
+ *   → QueryEngine.getPendingTasks()  ← 2026-07-03 变更：原本调
+ *     20_ProductivityModule.gs 的全局包装函数，现在直接调 QueryEngine
+ *     （包装函数已经不在本项目）
+ *   → SpreadsheetApp.openById  (只读 Rider OS Sheet)
+ *
+ * 08_Connector/ 【2026-07-08 新增】
+ *   ConnectorResponse.gs
+ *     → (无依赖，纯函数)
+ *   ConnectorTypes.gs
+ *     → ConnectorResponse.gs  (仅 ConnectorSupport.handle 内部懒引用，
+ *       不依赖加载顺序，见该文件文件头)
+ *     → 05_SheetUtils.gs  (shallowCopy_)
+ *   ConnectorRegistry.gs
+ *     → ConnectorTypes.gs  (ConnectorNames)
+ *     → ProductivityConnector.gs / ReminderConnector.gs  (懒引用，仅在
+ *       registerCoreConnectors_ 被调用时才需要存在)
+ *   ProductivityConnector.gs
+ *     → ConnectorTypes.gs  (ConnectorSupport/ConnectorErrors/
+ *       ConnectorValidation/ConnectorNames)
+ *     → ProductivityOS  (Library：createTask/updateTask/completeTask/
+ *       cancelTask/TaskQueryEngine.*)
+ *   ReminderConnector.gs
+ *     → ConnectorTypes.gs  (同上)
+ *     → QueryEngine.getPendingTasks() / QueryEngine.getTaskById()
+ *       (12_QueryEngine.gs，本项目本地既有，不是新代码)
+ *     → EventBus.getEventsByType()  (02_EventBus.gs，本项目本地既有)
+ *     → isOverdue_() / parseDueDate_()  (05_SheetUtils.gs，本项目本地
+ *       既有)
+ *     → 明确不依赖：ProductivityOS Library（哪怕是只读——"每个 Domain
+ *       OS 恰好一个 Connector"，Task 本身的读写请求一律走
+ *       ProductivityConnector.gs）；Reminder OS 的任何 Library/webhook
+ *       （不存在，见 D2/D5(2)）
+ *
+ * 93/94/95/96 (洞察层，未受 V3/V3.1/拆分 影响)
+ *   → 02_EventBus.gs  (93 只读 getAllEvents，不调 publish)
+ *
+ * ── 架构铁律（v3.1更新第3条，纳入ActiveTasks/ArchiveTasks；2026-07-03
+ *    拆分后第3/4/5条要按项目分开理解，见下方每条后的补充说明）───────────
+ * 1. 箭头只能往更底层指，禁止循环依赖（跨项目也一样：Core→ProductivityOS
+ *    是唯一方向，ProductivityOS 不能反过来依赖 Core）
+ * 2. Events 表只有 02_EventBus.publish() 能写（2026-07-03后：这句话按项目
+ *    理解——Inventory 事件只有 Core 的 02_EventBus.publish() 能写；
+ *    Task/Reminder 事件只有 Productivity OS / Reminder OS 各自的
+ *    02_EventBus.publish() 能写，三份代码逻辑一致，各管各的事件类型）
+ * 3. Tasks / Inventory / ActiveTasks Sheet（Read Model）只有对应项目的
+ *    10_ProjectionEngine 能写（_materializeTaskRow_ / _materializeInventoryRow_
+ *    是安全兜底，属例外）；ArchiveTasks 只有 Productivity OS 项目的
+ *    13_ActiveTasksEngine.runDailyArchive() 能写（冷归档专属）
+ * 4. 所有 Telegram 读操作必须经过对应项目的 12_QueryEngine 或
+ *    13_ActiveTasksEngine，禁止直接 derive Events
+ * 5. 所有 Create 操作必须经过对应项目的 09_IdempotencyManager，禁止直接
+ *    EventBus.publish CREATE 事件
+ * 6. AI 模块（93/94/95，仍在 Core）只产出文字，不写 Events，不改 Task 状态
  */

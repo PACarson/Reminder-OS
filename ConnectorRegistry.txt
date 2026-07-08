@@ -1,0 +1,256 @@
+/**
+ * ConnectorRegistry.gs
+ * Personal AI Core — Connector Layer / 注册表（唯一查找入口）
+ *
+ * 【新增文件】Connector Layer V1 落地的一部分，完整背景/架构见本目录
+ * README.gs，决策记录见 00_Project_Constitution.gs 二/平台架构 D5(3)。
+ *
+ * 职责：
+ *   - 注册 connector（register）
+ *   - 按名字查找 connector（get / has / list）
+ *   - 懒加载（factory 只在第一次真正被 get() 到时才执行一次，取结果缓存）
+ *   - 健康检查聚合（healthCheckAll）
+ *   - 能力发现聚合（capabilitiesAll）
+ *   - 给未来新增 Domain OS 留的动态注册入口（register 本身就是，不需要
+ *     额外再加一个"未来专用"的方法）
+ *
+ * ⚠️ 加载顺序安全性（重要，务必读完再改这个文件）：
+ * 05_SheetUtils.gs 的文件头注释记录过一次真实踩坑——"GAS按文件名字母序
+ * 加载，后加载的文件会静默覆盖先加载的文件的同名声明"。这里存在一个类似
+ * 但方向相反的风险：如果本文件（或 ProductivityConnector.gs/
+ * ReminderConnector.gs）在【顶层】（不在任何函数体内）直接写
+ * "ConnectorRegistry.register('Productivity', ...)"这种自注册语句，
+ * 那么这条语句能不能跑成功，取决于 ConnectorRegistry 这个全局变量在
+ * "该语句所在文件被加载执行"的那一刻是不是已经赋值完成——而这完全依赖
+ * GAS 按什么顺序拼接三个 Connector 文件，属于不应该依赖的隐性顺序。
+ *
+ * 本文件的解法：不在任何文件的顶层写自注册语句。注册逻辑
+ * （registerCoreConnectors_）是一个普通的具名函数声明——具名函数声明在
+ * GAS/JS 里无论物理文件顺序如何都会被完整提升（hoisting），本身不会
+ * ReferenceError；而它函数体内引用的 ProductivityConnector/
+ * ReminderConnector/ConnectorRegistry 这些全局变量，只有在这个函数真正
+ * 被调用的那一刻才需要存在——而"真正被调用"发生在 get() 内部（见下面
+ * _ensureBootstrapped_），也就是运行期第一次有人查找 connector 的时候，
+ * 那时候全部文件早就加载完毕。这样"注册"这件事既满足需求方要求的
+ * "Lazy loading"，又完全不依赖文件加载顺序。
+ */
+
+var ConnectorRegistry = (function () {
+
+  var _connectors = {};      // name -> { factory, instance, registeredAt }
+  var _bootstrapped = false;
+
+  // ============ 内部：懒加载引导 ============
+
+  function _ensureBootstrapped_() {
+    if (_bootstrapped) return;
+    _bootstrapped = true; // 先置位再注册：即使 registerCoreConnectors_ 内部
+                           // 意外抛错，也不会每次 get() 都重复尝试
+    try {
+      registerCoreConnectors_();
+    } catch (e) {
+      Logger.log('[ConnectorRegistry] registerCoreConnectors_ 失败: ' + e.message);
+    }
+  }
+
+  // ============ 注册 / 查找 ============
+
+  /**
+   * @param {string} name       ConnectorNames 里的名字（或未来新 Domain OS
+   *                            自己的名字——Registry 本身不限制必须是
+   *                            ConnectorNames 里已有的值，这正是"Future
+   *                            Expansion"要求的"不改 Registry 就能加新
+   *                            connector"）
+   * @param {function(): object} factory  零参数函数，调用后返回 connector
+   *                            实例（该实例必须实现 create/update/delete/
+   *                            get/list/search/execute/health/capabilities
+   *                            九个方法）。factory 不会立即执行——见
+   *                            "Lazy loading"。
+   * @returns {boolean} 是否注册成功
+   */
+  function register(name, factory) {
+    if (!ConnectorValidation.isNonEmptyString(name)) {
+      Logger.log('[ConnectorRegistry] register 失败：name 必须是非空字符串');
+      return false;
+    }
+    if (typeof factory !== 'function') {
+      Logger.log('[ConnectorRegistry] register 失败：factory 必须是函数 (name=' + name + ')');
+      return false;
+    }
+    _connectors[name] = {
+      factory:     factory,
+      instance:    null,
+      registeredAt: new Date().toISOString()
+    };
+    return true;
+  }
+
+  /**
+   * 取消注册（主要给测试/未来热替换用，正常运行路径不需要调）。
+   * @param {string} name
+   * @returns {boolean}
+   */
+  function unregister(name) {
+    if (!_connectors.hasOwnProperty(name)) return false;
+    delete _connectors[name];
+    return true;
+  }
+
+  /**
+   * 查找 connector 实例。第一次查找某个 name 时才会真正调用它的
+   * factory()（懒加载），之后缓存复用同一个实例。
+   * @param {string} name
+   * @returns {object|null}  connector 实例，找不到则 null（不抛异常——
+   *                          "找不到"是调用方需要处理的正常情况，不是
+   *                          意外，参照 00_Project_Constitution.gs 对
+   *                          "错误处理不滥用异常"的一贯态度）
+   */
+  function get(name) {
+    _ensureBootstrapped_();
+
+    var entry = _connectors[name];
+    if (!entry) {
+      Logger.log('[ConnectorRegistry] get: 找不到已注册的 connector "' + name + '"');
+      return null;
+    }
+    if (entry.instance === null) {
+      try {
+        entry.instance = entry.factory();
+      } catch (e) {
+        Logger.log('[ConnectorRegistry] get: connector "' + name + '" 的 factory 执行失败: ' + e.message);
+        return null;
+      }
+    }
+    return entry.instance;
+  }
+
+  function has(name) {
+    _ensureBootstrapped_();
+    return _connectors.hasOwnProperty(name);
+  }
+
+  /**
+   * @returns {{name: string, initialized: boolean, registeredAt: string}[]}
+   */
+  function list() {
+    _ensureBootstrapped_();
+    var out = [];
+    for (var name in _connectors) {
+      out.push({
+        name:         name,
+        initialized:  _connectors[name].instance !== null,
+        registeredAt: _connectors[name].registeredAt
+      });
+    }
+    return out;
+  }
+
+  /**
+   * 便捷调用入口："Registry 成为唯一查找点"的完整体现——未来的 Workflow
+   * 层可以只认识 ConnectorRegistry.invoke()，不需要自己判断 connector
+   * 存不存在、方法存不存在。找不到 connector / 方法名不对，都会包装成
+   * 标准 ConnectorResponse 形状返回（不是找到了才标准化，找不到也一样
+   * 标准化），调用方永远只需要处理一种返回形状。
+   *
+   * @param {string} name        connector 名字
+   * @param {string} methodName  create/update/delete/get/list/search/
+   *                             execute/health/capabilities 之一
+   * @param {...any} args        转发给该方法的参数
+   * @returns {object} 标准 ConnectorResponse 形状
+   */
+  function invoke(name, methodName, args) {
+    args = Array.prototype.slice.call(arguments, 2);
+
+    var connector = get(name);
+    if (!connector) {
+      return ConnectorResponse.failure({
+        category: ConnectorErrorCategory.SYSTEM_ERROR,
+        code:     'CONNECTOR_NOT_FOUND',
+        message:  'No connector registered under name "' + name + '".',
+        details:  { availableConnectors: list().map(function (c) { return c.name; }) }
+      }, { metadata: { connector: name, method: methodName } });
+    }
+    if (typeof connector[methodName] !== 'function') {
+      return ConnectorResponse.failure({
+        category: ConnectorErrorCategory.SYSTEM_ERROR,
+        code:     'CONNECTOR_METHOD_NOT_FOUND',
+        message:  'Connector "' + name + '" has no method "' + methodName + '".',
+        details:  null
+      }, { metadata: { connector: name, method: methodName } });
+    }
+    return connector[methodName].apply(connector, args);
+  }
+
+  // ============ 健康检查 / 能力发现聚合 ============
+
+  /**
+   * 对每个已注册 connector 调用 health()，聚合成一个 map。单个 connector
+   * 的 health() 本身已经是防御性的（不会抛异常——见两个 Connector 文件的
+   * health() 实现），这里再加一层 try/catch 是防"connector 实例化失败"
+   * 或"health 方法本身缺失"这类比 health() 内部逻辑更早一步的问题。
+   * @returns {object} { [name]: ConnectorResponse }
+   */
+  function healthCheckAll() {
+    _ensureBootstrapped_();
+    var out = {};
+    for (var name in _connectors) {
+      out[name] = invoke(name, 'health');
+    }
+    return out;
+  }
+
+  /**
+   * 同上，改调 capabilities()。
+   * @returns {object} { [name]: ConnectorResponse }
+   */
+  function capabilitiesAll() {
+    _ensureBootstrapped_();
+    var out = {};
+    for (var name in _connectors) {
+      out[name] = invoke(name, 'capabilities');
+    }
+    return out;
+  }
+
+  return {
+    register:         register,
+    unregister:       unregister,
+    get:              get,
+    has:              has,
+    list:             list,
+    invoke:           invoke,
+    healthCheckAll:   healthCheckAll,
+    capabilitiesAll:  capabilitiesAll
+  };
+})();
+
+// ============================================================
+// 内建 connector 的注册函数（普通具名函数声明——见文件头"加载顺序安全性"）
+// ============================================================
+
+/**
+ * 只注册"当前已知的两个 Domain OS Connector"。未来新增 Domain OS
+ * （比如 Property OS/Finance OS，见 00_Project_State.gs 下一步第17条）
+ * 时，不需要改这个函数——新 Connector 自己的文件里可以在其他任何被显式
+ * 调用的地方（不是顶层）调 ConnectorRegistry.register(...) 来登记自己，
+ * 或者由本文件在这里追加一行——两种方式都不受文件加载顺序影响，选哪种
+ * 只是风格偏好，不是正确性问题。目前两个内建 connector 选择由本文件
+ * 统一登记，保持"谁登记了谁"一目了然。
+ */
+function registerCoreConnectors_() {
+  if (typeof ProductivityConnector !== 'undefined') {
+    ConnectorRegistry.register(ConnectorNames.PRODUCTIVITY, function () {
+      return ProductivityConnector;
+    });
+  } else {
+    Logger.log('[ConnectorRegistry] ProductivityConnector.gs 未加载，跳过注册（检查项目文件是否完整）');
+  }
+
+  if (typeof ReminderConnector !== 'undefined') {
+    ConnectorRegistry.register(ConnectorNames.REMINDER, function () {
+      return ReminderConnector;
+    });
+  } else {
+    Logger.log('[ConnectorRegistry] ReminderConnector.gs 未加载，跳过注册（检查项目文件是否完整）');
+  }
+}

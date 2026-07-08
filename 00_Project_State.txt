@@ -1,15 +1,21 @@
 /**
  * 00_Project_State.gs
- * Reminder OS v1.0 — 项目状态快照
+ * JARVIS CORE v3.1 — 项目状态快照
  *
- * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
- * Blueprint 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换
- * 确认；修复第一轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、
- * LOW RISK 1/2 共6项；完成 Phase A（Temporal Engine）Contract 设计+
- * 实现+测试；修复第二轮外部审计的 HIGH/MEDIUM/LOW RISK 各两项，并发现
- * 修复一个更严重的既有 bug（last_reminder_at 从未被写入，提醒频率控制
- * 实际从未生效）。
+ * 本文件只放四类内容：已完成 / 进行中 / 已知Bug / 下一步。
+ * 不放原则、不放规则、不放文件结构 —— 那些在 00_Project_Constitution.gs 和 00_File_Map.gs。
+ *
+ * ⚠️ 这是一份「快照」，不是日志。每次更新都覆盖旧状态，不要在这里堆历史记录。
+ * LAST_UPDATED: 2026-07-08 — 新增 08_Connector/ 统一 Connector Layer
+ *   （ConnectorResponse/ConnectorTypes/ConnectorRegistry 三个共用基础设施
+ *   + ProductivityConnector/ReminderConnector 两个 Domain OS Connector +
+ *   README），49个smoke test全过。详见下方"一、已完成"最新条目。
+ *   落地过程中确认两个已知能力边界（Productivity OS 无硬删除/无
+ *   Reopen；Reminder OS 七个写操作当前版本无后端可路由）+ 一个顺带
+ *   核实的既有行为（task_snooze: callback 目前是无状态变更的纯文案
+ *   回复），已分别记入"已完成"和"已知Bug/技术债"。"下一步"P3新增第18条
+ *   （既有直接Library调用点是否迁移到走Connector，留给 Carson 决定），
+ *   16/17条补充说明新 Connector Layer 可用。
  */
 
 // ============================================================
@@ -17,103 +23,368 @@
 // ============================================================
 
 /**
- * - 2026-07-03：从 Personal AI Core 物理拆分为独立项目。92_ReminderEngine.gs
- *   只改了 2 处（getPendingTasks() → QueryEngine.getPendingTasks()；
- *   _materializeTaskRow_(...) → upsertRowByKey_('Tasks', ...)，因为原来
- *   调的那两个函数所在的文件不在本项目了），判断逻辑逐字未改。
+ * ── V2.x / V3.0 历史（压缩摘要，细节不再变动）────────────────────────────
  *
- * - 2026-07-06：修复 HIGH RISK 2。_shouldRemind 新增 _hoursUntilDue 判断+
- *   REMINDER_ADVANCE_HOURS 常量（默认 72 小时，Claude 选的默认值，未逾期
- *   且距 due_date 超过这个提前量时直接不提醒）；里程类 due_date（'40000km'）
- *   维持原行为不受影响，等 RiderConnector 接好再处理。REMINDER_INTERVAL_HOURS
- *   数值未变。详见 2_Runtime/25_ReminderEngine.gs 的 "2026-07-06 bugfix" 注释。
+ * - 架构定稿：EventBus 唯一写入 / 状态全派生 / AI 只建议 / Output 唯一出口
+ * - V3.0 CQRS + Idempotency 架构升级：新增 07_IdentityEngine / 08_Dedup-
+ *   licationEngine / 09_IdempotencyManager / 10_ProjectionEngine /
+ *   11_ProjectionRebuilder / 12_QueryEngine 六个文件，解决重复创建/幂等性/
+ *   查询效率/读写职责混乱四个长期问题
+ * - Webhook 302 修复：doPost 改回 HtmlService.createHtmlOutput('ok')
+ * - ⚠️ V3 迁移步骤（迁移列/重建Projection/重新部署/重注册webhook）在
+ *   2026-06-28 标记为"待用户执行"，截至本次(2026-06-29)更新前未确认是否已跑完，
+ *   v3.1 的迁移步骤已与 v3.0 的合并成一套（见下方"下一步"），不需要分两次跑。
  *
- * - 2026-07-06：全部文件按 Domain OS Blueprint（Governance/Foundation/
- *   Runtime/Intelligence/Integration/Testing）重新组织到对应文件夹+新编号，
- *   00_File_Map.gs 全面重写，00_Project_Constitution.gs 新增 P5，新增
- *   00_ADR_001_Domain_OS_Blueprint_Adoption.gs 记录采用理由和具体判断。
- *   GAS 是扁平命名空间、没有 import，重命名/挪动文件不影响任何调用关系，
- *   这次改动纯粹是物理位置+文件名+文档，不涉及任何函数签名或调用方式变化。
+ * ── 2026-06-29：V3.1 Bug Fix Sprint（外部审计12项 + help/我的任务路由Bug）──────
  *
- * - 2026-07-06：收到 15_Setup.gs 真实代码，确认打包时那份内容确实是误把
- *   12_QueryEngine.txt 复制进去了。已用真实代码替换 1_Foundation/11_Setup.gs
- *   里之前那份反推重建版。真实版 runDiagnostics() 比重建版多做了
- *   SPREADSHEET_ID / TELEGRAM_TOKEN 各自独立的存在性检查，且是逐条
- *   Logger.log 输出诊断信息的风格，不返回结构化对象——File_Map/README
- *   当初对这个文件行为的文字描述本身没有问题，纯粹是 zip 打包时这一个
- *   文件被顶替了。
+ * 背景：外部审计对 V3.0 架构提出 HIGH/MEDIUM/LOW 三档共8个问题点
+ * （部分点位涉及多个函数，原始编号见下），逐项核实后采纳并修复：
  *
- * - 2026-07-06：修复外部审计对 2_Runtime/25_ReminderEngine.gs、
- *   2_Runtime/20_EventBus.gs 的新一轮发现，按严重程度全部处理，完整决策
- *   依据见 00_ADR_002_ReminderEngine_Audit_Fixes.gs：
- *   · HIGH RISK 1：checkReminders 循环里不再逐任务调 upsertRowByKey_
- *     （O(N)次全表扫描式 Sheet I/O），改成循环内只更新内存、结束后
- *     batchUpsertRowsByKey_ 一次性批量写回。
- *   · HIGH RISK 2：_sendReminder 之间加 Utilities.sleep(1000)，避免撞
- *     Telegram 单聊天每秒最多1条消息的限流（已查官方 Bots FAQ 核实限额）。
- *   · MEDIUM RISK 1：这个耦合本身没法从 Reminder OS 单边"修掉"（webhook
- *     注册和 callback 解析都在 Personal AI Core 项目）——补的是文档约束
- *     （00_Project_Constitution.gs 新增 P6）和诊断可达性检查
- *     （1_Foundation/11_Setup.gs 的 runDiagnostics() 新增 getWebhookInfo
- *     检查）。这条严格说是"降低风险+文档化"，不是"消除风险"，见下面
- *     「已知问题」。
- *   · MEDIUM RISK 2：25_ReminderEngine.gs 全部逻辑和常量包进 IIFE
- *     （ReminderEngine 模块），不再平铺全局。对审计原始建议做了修正：
- *     checkReminders 必须保留一个薄的全局函数转发，因为 GAS 触发器按
- *     字符串名字找全局函数绑定，找不到 IIFE 返回对象的属性。
- *   · LOW RISK 1：lock.waitLock 从 5000ms 延长到 30000ms（HIGH RISK 2
- *     的节流会让单次执行变长，5秒等待太容易误判"前一个没跑完"而跳过）。
- *   · LOW RISK 2：20_EventBus.gs 的 _sheet_() 新增惰性缓存，同一次执行内
- *     不再重复 SpreadsheetApp.openById。
- *   全部6项改动都用 mock GAS 环境跑过针对性验证（批量写入次数、节流调用
- *   次数、IIFE 封装后内部函数不再泄漏到全局、webhook 诊断两种分支），
- *   不是只凭代码审查判断"看起来对"。
+ * 【HIGH RISK】
+ *   1. 09_IdempotencyManager.gs（createTaskIfNotExists/createInventoryIfNotExists）
+ *      问题：去重校验与创建写入是分离的两步，无锁保护，并发Webhook下两个
+ *      实例都判断"不存在"从而同时创建，幂等失效。
+ *      修复：整个"读-校验-写"过程用 LockService.getScriptLock()（waitLock
+ *      10s，finally释放）包住，强制串行化。
  *
- * - 2026-07-06：完成 Phase A（Temporal Engine）的 A0（Contract 设计，
- *   00_ADR_004_Temporal_Engine_Design.gs）+ A1（实现，
- *   1_Foundation/12_TemporalEngine.gs）。Gate Review 5点确认（时间基准/
- *   错误处理约定/测试矩阵/性能上限/调用关系）+ 4条精化（Immutable/Pure
- *   Function/timezone 参数取舍/Dependency Rule）全部并入 ADR-004。
- *   实现过程中发现并修了一个真实 Contract 漏洞：every_n_days 原本没有
- *   锚点日期，同一条规则从不同时间点查询会得到不一致结果——补上了必填
- *   的 start_date 字段，回写进 ADR-004（没有绕开 Contract 直接在代码里
- *   悄悄兼容）。5_Testing/50_TemporalEngine_Tests.gs 覆盖完整 Test
- *   Matrix（含闰年、世纪年边界、月份溢出跳过、fromTime/untilTime精确
- *   命中、parseRule非法输入、Immutable验证、Reminder/Finance/Vehicle
- *   三种视角消费者验证），39项测试全部通过。
- *   决定不另开 00_ADR_005（Foundation Module Rules）——一是这条建议里
- *   把 22_QueryEngine.gs 归为 Foundation 层是事实错误（实际是 Runtime/
- *   Query，而且它本来就会读 Sheet，跟"禁止碰 Sheet"直接冲突）；二是
- *   目前只有 Temporal Engine 一个 Foundation 新模块，"所有 Foundation
- *   模块都要遵守"这句话现在只有一个真实案例支撑，属于 Progression Rule
- *   要避免的"为还不存在的未来模块预先定规则"，理由见 ADR-004。
+ *   2. 11_ProjectionRebuilder.gs（rebuildTasksProjection/rebuildInventory-
+ *      Projection）
+ *      问题：循环里逐个调 upsertRowByKey_，O(N)次Sheet I/O，历史Events多
+ *      时极易触发6分钟执行超时。
+ *      修复：新增 05_SheetUtils.batchUpsertRowsByKey_()——一次性读全表→
+ *      内存合并→最多2次setValues()写回，I/O次数固定≤3次，跟数据量无关。
  *
- * - 2026-07-06：修复第二轮外部审计对 25_ReminderEngine.gs/20_EventBus.gs/
- *   21_SheetUtils.gs 的发现（HIGH/MEDIUM/LOW 各两条），完整依据见
- *   00_ADR_002_ReminderEngine_Audit_Fixes.gs 的「第二轮外部审计」章节：
- *   · HIGH RISK 1（新）：checkReminders 的批量写延后到循环结束，如果
- *     执行因超时被打断，批量写永远不会执行——这是上一轮 HIGH RISK 1
- *     修复本身带来的新风险。加了时间预算机制，接近6分钟上限就提前
- *     中断循环，但中断前已处理的任务仍然保证批量写入。
- *   · HIGH RISK 2（新）：_sendReminder 之前丢弃了 Output.sendMessage
- *     的返回值，发送失败时依然照常更新提醒状态，造成静默丢失。改成
- *     只有确认发送成功才更新状态。
- *   ⚠️【意外发现，不在审计报告里，写回归测试时自己测出来的、影响比
- *   这轮任何一条审计发现都大】_recordReminderSent 从最早的版本开始就
- *   只更新了 reminder_count，从来没有设置过 last_reminder_at——导致
- *   REMINDER_INTERVAL_HOURS 按优先级分级的提醒间隔（4/6/12/24小时）
- *   实际上从来没有生效过，所有任务只要满足提醒条件，每小时触发器跑
- *   一次就会重发一次。已修复，并新增"连续跑两次checkReminders，第二次
- *   不应该重发"的回归测试验证。
- *   · LOW RISK 1（新）：21_SheetUtils.gs 包进 IIFE（是最后一个还没
- *     IIFE 化的"引擎风格"文件），22_QueryEngine.gs/25_ReminderEngine.gs
- *     的调用方式同步改成 SheetUtils.xxx 命名空间形式。
- *   MEDIUM RISK 1（新）、MEDIUM RISK 2（新）、LOW RISK 2（新）核实
- *   属实但决定不修，理由见「已知问题」。
- *   新写 5 组端到端测试（发送失败/发送成功/时间预算耗尽/部分处理后
- *   耗尽预算仍保证已处理部分落盘/单任务异常不拖累整批），加上
- *   "连续两次执行"的回归测试，第一轮遗留的全部测试（8个原始场景+
- *   TemporalEngine 39个+EventBus缓存验证）一并重跑确认无回归。
+ *   3. 02_EventBus.gs（publish）
+ *      问题：Projection失败只写Logger日志，没有主动告警，Read Model与
+ *      Event Store无声不一致（Silent Degradation），管理员难以及时发现。
+ *      修复：catch块里新增 _alertAdminProjectionFailure_()，通过Telegram
+ *      向TELEGRAM_CHAT_ID推送告警（包try/catch，告警本身失败不影响主流程）。
+ *
+ * 【MEDIUM RISK】
+ *   1. 06/22 IntentParser的_cleanTitle_ + 20/21模块的shallowCopy_/
+ *      shallowCopyInv_ 全局重复声明
+ *      问题：GAS扁平全局命名空间下，多文件各自声明同名/同逻辑函数，后加载
+ *      覆盖先加载，未来任一处改逻辑会导致另一处隐蔽异常（犯C5）。
+ *      修复：统一搬到 05_SheetUtils.gs（共用_cleanTitle_/shallowCopy_），
+ *      06/20/21/22 的同名声明全部删除，调用方代码不变。
+ *      ⚠️ 范围说明：原始建议是把整个模块包进IIFE，但IdempotencyManager/
+ *      ProjectionRebuilder/RiderConnector等多处依赖_createTaskDirect_/
+ *      createTask/getPendingTasks是"裸全局函数"这个事实（File_Map有明确
+ *      记录），完整IIFE封装是跨文件大重构，本次只解决"重复实现"这个具体
+ *      风险点，完整封装列入下方"下一步"。
+ *
+ *   2.（外部审计原始编号，未采纳为代码修改，已记录评估结论）
+ *      02_EventBus.gs/10_ProjectionEngine.gs 同步链路过长
+ *      问题：Webhook→解析→查重→写Event→同步Projection→再次查重定位→
+ *      覆写Read Model，链路长，理论上可能导致Telegram超时重试。
+ *      评估：该问题点名的后果（重试导致重复创建/线程耗尽）已被本轮HIGH
+ *      RISK 1的ScriptLock + 既有的update_id去重缓存（04_Main.gs，600秒
+ *      窗口）双重覆盖，数据层面不会再因为重试产生重复。剩下的是纯延迟/
+ *      响应速度的UX问题，不是正确性Bug。是否要改成"先200 OK，Projection
+ *      和发消息丢进异步触发器"——这会把"发一句话立刻收到确认回复"变成
+ *      "收到处理中提示+稍后第二条消息"，是用户体验层面的取舍，不应该被
+ *      默默改掉，需要 Carson 决定（见下方"下一步"）。
+ *
+ *   3. 10_ProjectionEngine.gs（projectInventoryRestocked_/
+ *      projectInventoryUsed_/projectReminderSent_）read-modify-write竞态
+ *      问题：先读current_stock/reminder_count再算增量写回，无锁场景下并发
+ *      可能读到同一旧值，发生Lost Update。
+ *      修复：
+ *        - restockItem路径：已在IdempotencyManager的锁范围内（HIGH 1已覆盖），
+ *          21_InventoryModule.gs加了文档注释，明确"不可在restockItem内部
+ *          再加锁"（GAS LockService不可重入，会死锁），未来若有新调用方
+ *          不经过IdempotencyManager，必须在那一侧加锁。
+ *        - useItem路径：这是唯一真正"裸露无锁"的路径（22_InventoryIntent-
+ *          Parser.gs直接调用，不经IdempotencyManager），21_InventoryModule.gs
+ *          的useItem()内部新增自行获取ScriptLock。
+ *        - projectReminderSent_：目前92_ReminderEngine.gs尚未接入这条路径
+ *          （仍用_materializeTaskRow_安全兜底路径，这是已知技术债，见下方
+ *          "已知Bug"和之前就有记录的P1计划项），所以这个read-modify-write
+ *          目前是死代码，暂不加锁；待92正式接入EventBus.publish('REMINDER_
+ *          SENT')那天，要同步给这条路径补锁。
+ *
+ * 【LOW RISK】
+ *   1. 22_InventoryIntentParser.gs（_extractQtyUnit_）
+ *      问题：只匹配字符串里第一个"数量+单位"，复合句"3个苹果和5个香蕉"会
+ *      把"和5个香蕉"整段误并入物品名。
+ *      修复：检测"和/还有/以及/跟+数字"复合连接词，截断到连接词前，
+ *      并通过truncatedTail告知调用方，回复文案里主动提示用户哪部分没被
+ *      记录，而不是默默吃掉数据。仍不支持真正多物品单句拆分（按P6不过度
+ *      设计，引导用户分两句发送）。
+ *
+ *   2. 20_ProductivityModule.gs/21_InventoryModule.gs 全局配置变量裸露
+ *      （TASK_CATEGORIES/TASK_PRIORITIES/TASK_RECURRING/TASKS_SHEET_NAME/
+ *      INVENTORY_SHEET_NAME）
+ *      问题：裸全局变量，未来加Property OS/Shopping OS易碰撞/被意外修改。
+ *      修复（范围收窄，理由同MEDIUM 1）：收进Object.freeze()命名空间对象
+ *      （ProductivityConfig / InventoryConfig），保留原变量名作向后兼容
+ *      别名（指向同一数组引用），调用代码不变，但数组内容现在被冻结，
+ *      防止被外部脚本意外push/修改。完整IIFE封装列入"下一步"。
+ *
+ * 【独立Bug修复】Telegram "help"/"/help"/"我的任务" 被误判成建任务
+ *   根因：parseTaskIntent末尾的TASK_CREATE兜底过于贪婪（任何≥2字符未匹配
+ *   文本都建任务）；且原TASK_LIST的"我的任务"类正则要求必须带"列表"后缀，
+ *   "我的任务"四个字本身不匹配，于是连同"help"一起落进兜底被建成任务。
+ *   修复：
+ *     - 04_Main.gs：_handleMessage_最前面加 /help 全局短路，匹配到直接回帮助
+ *       文本，不进入任何意图解析器（双重保险中的第一层）
+ *     - 06_TaskIntentParser.gs：parseTaskIntent开头新增help类命令排除，
+ *       TASK_LIST正则改为"列表"后缀可选+显式覆盖"我的任务/待办任务"等高频词，
+ *       skipPatterns新增兜底"/^\\//"拦截所有未识别的slash命令（双重保险第二层）
+ *
+ * ── 2026-06-29：ActiveTasks / ArchiveTasks 工作台+冷归档 落地 ─────────────
+ *
+ * 采纳"方案三"四层结构（Events→Tasks→ActiveTasks→ArchiveTasks），具体设计：
+ *   - Tasks 不拆，继续是全量Read Model（DeduplicationEngine/QueryEngine依赖它）
+ *   - ActiveTasks：10_ProjectionEngine.gs 在 dispatch() 里跟 Tasks 同步维护
+ *     （TASK_CREATED→插入，TASK_COMPLETED/CANCELLED→deleteRowByKey_物理删除），
+ *     零延迟，没有"Tasks已DONE但ActiveTasks还没清掉"的窗口期。
+ *     20_ProductivityModule.gs的_materializeTaskRow_安全网同步打了一个连带
+ *     补丁：如果ProjectionEngine.dispatch失败过（安全网被触发），且最终
+ *     status是DONE/CANCELLED，安全网现在也会顺手清ActiveTasks残留行，
+ *     避免两张表在"ProjectionEngine失败"这个边界情况下出现不一致窗口。
+ *   - ArchiveTasks：新增 13_ActiveTasksEngine.gs，runDailyArchive()由每日
+ *     定时触发器(triggerDailyArchive，凌晨2点)调用，把Tasks里DONE/CANCELLED
+ *     且completed_at超过7天(可调)的行搬过去，Tasks对应行标记archived=true
+ *     防止重复搬运（不物理删除Tasks的行，保留全量Read Model完整性，否则
+ *     rebuildAllProjections会失去重建依据）。
+ *   - Telegram命令：
+ *       "/tasks"/"我的任务" 等 → 改读ActiveTasks（06_TaskIntentParser.gs
+ *       的_getActiveTasksForDisplay_，ActiveTasks不存在时自动降级读
+ *       getPendingTasks兜底）
+ *       新增 "/history"/"历史" → 读Tasks里近期DONE/CANCELLED（最多30条）
+ *       新增 "/archive"/"归档" → 读ArchiveTasks（13_ActiveTasksEngine.
+ *       getArchivedTasks，最多20条）
+ *   - 11_ProjectionRebuilder.gs：migrateAddIdentityColumns()新增给Tasks加
+ *     archived列、给ActiveTasks/ArchiveTasks补列；新增
+ *     rebuildActiveTasksProjection()（清空重写策略，全量重建场景用）；
+ *     rebuildAllProjections()串联调用。
+ *   - 15_Setup.gs：setupSheets()新增建ActiveTasks/ArchiveTasks两张表（已含
+ *     identity/archived_at列，新表不需要走迁移路径）；createTriggers()新增
+ *     triggerDailyArchive（凌晨2点），跟其他三个定时任务用同一套"先清旧的
+ *     同名触发器再建新的"幂等模式管理，不另开一个独立的"挂触发器"函数。
+ *   - "Today Dashboard"（🔥今天/⚠️已逾期/📅明天 分组视图）：按Carson要求
+ *     列入下方"下一步"，本次不做。
+ *
+ * ── 2026-06-29：宪法修订 —— V4-AAA + UDP（P6.1更新 + 新增P6.2）──────────
+ *
+ * 背景：外部AI（非Claude）提出"Unified OS Architecture V3/V4"，经讨论分两部分
+ * 评审：
+ *   (a) 数据合并部分（把Task/Inventory/Finance/Vehicle合成一个Entity系统）
+ *       → 仍然驳回，跟V5驳回理由相同：违反"Rider OS是独立项目"边界。
+ *   (b) 协议统一部分（所有Domain OS遵循Request→Planner→Decision→Execution→
+ *       Events→Projection→Insights→Bridge统一生命周期模板）→ 采纳，
+ *       重命名为"Unified Domain Protocol (UDP)"，写入新增的P6.2。
+ *   AI-Native部分同样分两半：
+ *     "AI自动选择/组合Domain OS并直接执行" → 驳回，违反P4。
+ *     "AI做理解→推理→规划→提建议，Execution永远在用户确认之后" → 采纳，
+ *     命名为"V4 AI-Native Advisory Architecture (V4-AAA)"，写入P4的澄清段落，
+ *     不修改P4本身的文字，只是明确V4-AAA的边界落在P4允许的范围内。
+ * 具体改动：00_Project_Constitution.gs
+ *   - P4 新增【V4 AI-Native Advisory Architecture 的边界】澄清段落
+ *   - P6.1 更新：把"Unified OS V3/V4 AI-Native"的评审结论补充进去
+ *     （区分驳回的部分 vs 重新评审后采纳的部分），V5/V6/V7驳回记录原样保留
+ *   - 新增 P6.2「Unified Domain Protocol (UDP)」：协议模板，不要求现有
+ *     系统立即重构，不改变Domain边界，不允许跨Domain合并数据，User
+ *     Confirmation步骤不可省略（遵循P4）
+ */
+
+/**
+ * ── 2026-07-01：V3.2 外部审计HIGH1-3/MEDIUM2-3 + Recurring Task自动续期 ───
+ *
+ * 背景：外部审计对V3.1代码库提出新一轮HIGH/MEDIUM/LOW共8个问题点，逐项核实
+ * 后采纳6项、拒绝1项（附理由）、暂缓2项（附理由）。⚠️编号是这次审计的独立
+ * 编号，跟2026-06-29那轮审计的HIGH/MEDIUM/LOW编号是两套不同的东西，指的是
+ * 不同问题，不要混着看。
+ *
+ * 【HIGH RISK】
+ *   1. 11_ProjectionRebuilder.gs（rebuildTasksProjection/rebuildInventory-
+ *      Projection）循环单行upsertRowByKey_，O(N)次Sheet I/O。
+ *      核实结论：属实，且发现这是一处doc/code drift——05_SheetUtils.gs的
+ *      batchUpsertRowsByKey_函数2026-06-29就已经新增了，但调用方
+ *      （本条目点名的两个函数）当时从没真正切换过去调用它，File_Map却已经
+ *      把"切换调用"也记成了2026-06-29完成。跟之前抓到的"ProjectionRebuilder
+ *      停在v3.0基线、文档按v3.1描述"是同一类问题。
+ *      修复：两个函数改成收集数组后一次性调batchUpsertRowsByKey_。
+ *
+ *   2. 11_ProjectionRebuilder.gs（rebuildAllProjections）缺少ActiveTasks
+ *      视图的重建支持，文档声称存在的rebuildActiveTasksProjection函数
+ *      实际不存在。
+ *      核实结论：属实，也是doc/code drift——File_Map一直写着这个函数
+ *      "v3.1新增"，代码里从未真正实现过。
+ *      修复：新增rebuildActiveTasksProjection()（清空ActiveTasks数据行→
+ *      从Events推导全部非终态任务→批量写回；用"清空+重写"而非upsert，
+ *      因为ActiveTasks是过滤视图，语义上必须能清掉终结了但卡住的陈旧行，
+ *      理由见函数内注释），并接入rebuildAllProjections()。
+ *      连带发现第3处drift：File_Map还声称verifyProjection()已经在调用
+ *      一个叫_verifyActiveTasksConsistency_的校验函数，这个函数同样从未
+ *      真正存在过。既然已经在这个文件工作，顺带把这个函数也实现了，接入
+ *      verifyProjection()。
+ *
+ *   3. 13_ActiveTasksEngine.gs（runDailyArchive）标记archived=true时在
+ *      forEach循环里逐行setValue()，O(N)次Sheet写入。
+ *      核实结论：属实。
+ *      修复：收集阶段就地在内存row引用上打标记（row跟allRows[idx]同一个
+ *      引用），最后对整个archived列一次性setValues()，物理I/O固定1次。
+ *      安全性：archived列全代码库只有这个函数写，不存在并发覆盖风险，
+ *      可以放心整列覆写。
+ *      ⚠️ 独立发现的关联bug（不在原始审计范围内，验证HIGH RISK 3时顺带
+ *      发现）：13_ActiveTasksEngine.gs文件头一直声称"archived列由
+ *      migrateAddIdentityColumns()添加"，但该函数实际代码从来只加过
+ *      identity，从未加过archived。这意味着如果Tasks表从未有过archived列，
+ *      runDailyArchive里"是否已归档过"的判断永远读到false，导致同一批
+ *      DONE/CANCELLED超过7天的任务每天被重复搬进ArchiveTasks，越攒越多
+ *      重复行。已在migrateAddIdentityColumns()里补上archived。
+ *      ⚠️ 如果你的部署已经运行过一段时间的triggerDailyArchive（每天凌晨
+ *      2点），ArchiveTasks里可能已经积累了重复行。这次代码修复只解决
+ *      "以后不再重复"，历史脏数据需要你自己决定要不要手动清理（比如按
+ *      task_id只保留archived_at最早的一行）——没有主动帮你清，因为
+ *      ArchiveTasks设计是append-only，不该在没有明确授权时自动删数据。
+ *
+ * 【MEDIUM RISK】
+ *   1.（外部审计原始编号，未采纳为代码修改，已记录评估结论）
+ *      02_EventBus.gs（getAllEvents）每次调用全量读Events表+JSON.parse
+ *      全部行，Events积累到几千上万条后/insights查询内存开销变大。
+ *      建议修复：增加时间窗口过滤（近90天）。
+ *      评估结论：拒绝这个具体修复方案——会破坏93_MemoryEngine.gs一个刻意
+ *      设计的功能。核实代码后发现_buildTaskLifecycles_对全量Events只读
+ *      一次，之后在同一份lifecycle数组上做两次不同过滤的聚合：
+ *      patternGroups（近90天）和insightGroups（sinceMs=null，明确不限
+ *      时间窗口，门槛更高，这是"看长期模式"功能的核心设计，不是疏漏）。
+ *      如果在Events层面加90天窗口过滤：(a) insight_alltime会直接看不到
+ *      90天前的数据，功能被废掉；(b) 更隐蔽的问题是pattern_90d本身也会
+ *      被破坏——一个200天前创建、5天前完成的任务，它的TASK_CREATED事件
+ *      在90天窗口外会被过滤掉，_buildTaskLifecycles_的reducer要求先见到
+ *      CREATED才会建立lifecycle记录，TASK_COMPLETED即使在窗口内也会因为
+ *      找不到对应的lifecycle记录被静默丢弃，导致pattern_90d反而漏计这个
+ *      任务。所以"时间窗口过滤"在这个代码结构下无论加在哪一层都会牺牲
+ *      正确性，不是单纯的"改一下参数"就能做到。
+ *      暂不处理的理由：/insights是低频、用户主动触发的命令，不是Webhook
+ *      热路径；真正不牺牲正确性的修复方向是"改成增量维护的聚合表"（类似
+ *      ActiveTasks的实时维护思路，在TASK_COMPLETED/CANCELLED时增量更新
+ *      聚合结果，而不是每次全量重放），这是比"加个时间过滤参数"大得多的
+ *      架构改动，等Events实际增长到/insights有可观测延迟时再做（可以先
+ *      加Logger.log计时确认）。
+ *
+ *   2. 21_InventoryModule.gs（useItem）lock.waitLock(10000)超时时未捕获
+ *      异常，一路冒穿到doPost，用户收到裸错误信息，库存未扣减成功。
+ *      核实结论：属实。
+ *      修复：useItem()返回值从undefined变成{success, error?}。获取锁的
+ *      try/catch跟实际临界区（发布事件+安全兜底覆写）的try/finally拆开——
+ *      只有锁超时本身会被捕获返回失败状态，临界区内其他错误（不是这次
+ *      审计范围）维持原样向上抛，不扩大掩盖面。调用方
+ *      （22_InventoryIntentParser.gs的INVENTORY_USE分支）检查success
+ *      字段，锁超时时回"系统繁忙，请稍后再发一次"。
+ *
+ *   3. 15_Setup.gs（setupSheets）初始表头不含V3.1所需的identity/archived/
+ *      status列，只有额外手动跑migrateAddIdentityColumns()才补全，新用户
+ *      容易漏跑导致去重静默失效。
+ *      核实结论：属实（08_DeduplicationEngine.gs的_findRowByIdentity_确认：
+ *      找不到identity列时打Warning后返回null，等效于永远查不到重复）。
+ *      修复：setupSheets()的Tasks/Inventory初始表头直接加入这些列；
+ *      repairSheetHeaders()的硬编码表头列表同步更新保持一致；
+ *      migrateAddIdentityColumns()仍保留给已有旧数据的部署做迁移用。
+ *
+ * 【LOW RISK】
+ *   1. 09_TemporalParser.gs（extractDateTime）跨时区场景用
+ *      Session.getScriptTimeZone()而非用户实际时区，可能导致提醒时刻偏差。
+ *      核实结论：属实，但影响面对当前"单人个人系统、脚本时区=Carson自己
+ *      时区"的实际部署场景很小。
+ *      暂不处理：完整修复需要新增per-chat时区偏好存储+改造TemporalParser/
+ *      ReminderEngine多处读取逻辑，是一次专门的功能，不适合夹在这轮bug
+ *      修复里顺手做。列入"下一步"，如果未来有多用户/跨时区场景再启动。
+ *
+ *   2. 09_IdempotencyManager.gs 与 20/21 模块双向硬编码耦合（Idempotency-
+ *      Manager直接调_createTaskDirect_/_createInventoryDirect_/restockItem，
+ *      这些模块入口又反向调IdempotencyManager），不利于独立单元测试。
+ *      核实结论：属实，纯架构/可测试性问题，不是运行时bug。
+ *      暂不处理：完整修复（回调注入/依赖倒置）是跨文件重构，风险和这次
+ *      "修bug"的范围不匹配——跟2026-06-29那轮LOW RISK 2（配置变量裸露）
+ *      当时选择"只做范围更小的修复、完整IIFE封装留作future"是同一个
+ *      判断逻辑。列入"下一步"P2，跟"完整IIFE封装"放在一起做，两者会
+ *      触碰同一批调用方。
+ *
+ * ── 2026-07-01：Recurring Task 自动续期（非外部审计项，回应Carson实际
+ *    使用中报告的问题）──────────────────────────────────────────────────
+ *
+ * 问题：输入"每个月25号交房租"（月度recurring），done掉当月那次后，系统
+ * 没有自动生成下个月的task。
+ *
+ * 根因：09_TemporalParser.gs此前的范围声明就明确写着"只解析用户说的重复
+ * 规则+算出第一次due_date，不负责完成后自动生成下一次"——这不是bug，是
+ * 之前有意识收窄的范围，等待中的是"真正的recurring task engine"（完整
+ * 支持ND/NW/interval>1，需要Tasks schema先能存下完整recurrence_rule对象，
+ * 不只是现在的Daily/Weekly/Monthly/Yearly四个legacy字符串）。
+ *
+ * 这次没有做"完整recurring task engine"（那仍然要等schema扩展），而是做了
+ * 一个刻意收窄、不需要任何schema改动的子集：
+ *   - 09_TemporalParser.gs 新增 computeNextDueDateFromLabel(prevDueDateStr,
+ *     recurringLabel)：只用已经在持久化的legacy字符串（Daily/Weekly/
+ *     Monthly/Yearly，interval固定1）+已完成任务自己的due_date，算出下
+ *     一次due_date。复用现成的_rollForwardOneCycle_逻辑。
+ *   - 20_ProductivityModule.gs 的 completeTask() 完成时调用新增的私有函数
+ *     _spawnNextRecurrenceIfNeeded_：如果任务是recurring的，算出下一次
+ *     due_date后直接走IdempotencyManager.createTaskIfNotExists()生成，
+ *     复用现成幂等创建路径（同一个due_date+title+recurring+priority+
+ *     category算出的identity完全一样，就算completeTask因为webhook重试
+ *     被调用两次，DeduplicationEngine会把第二次识别成"已存在"直接跳过，
+ *     不需要给"生成下一次"这个动作单独再做一层幂等保护）。
+ *   - completeTask()返回值从undefined变成{next_task}，
+ *     06_TaskIntentParser.gs（TASK_DONE分支）和04_Main.gs（_handleCallback_
+ *     的task_done:分支）都更新，在完成回复里展示新生成的下一次，让用户
+ *     能直接确认"续上了"。
+ *   - 范围边界（刻意，不是遗漏）：只对completeTask生效，cancelTask不会
+ *     自动生成下一次——取消是用户主动表示"这一次不需要了"，是否要连未来
+ *     所有次都停掉是有歧义的产品行为（"每年生日"被取消一次，明年该不该
+ *     继续提醒？），这次不擅自决定。只支持interval=1的四种legacy类型，
+ *     跟现有TASK_RECURRING能持久化的范围完全一致，ND/NW/interval>1这些
+ *     从06_TaskIntentParser.gs的_recurrenceRuleToLegacyString_那一步就
+ *     已经被转成''了（根本没被存下来），不是这个功能引入的新限制。
+ *   - 已核实80_RiderConnector.gs的completeTask调用方不受影响：该模块
+ *     创建的任务从不设置recurring，且该调用方本就丢弃completeTask的
+ *     返回值。
+ *   - 用具体case验证过date-math：2026-06-25(Monthly)→2026-07-25、
+ *     2026-05-03(Yearly)→2027-05-03，等等，含月末溢出边界case（继承自
+ *     _rollForwardOneCycle_已有的已知限制，不是新引入的）。
+ *
+ * 2026-07-08 — 新增 08_Connector/ 统一 Connector Layer（见
+ * 00_Project_Constitution.gs D5(3)、08_Connector/README.gs）：
+ *   - 六个文件：ConnectorResponse.gs（响应DTO工厂）/ ConnectorTypes.gs
+ *     （错误分类+校验小工具+ConnectorSupport.handle标准执行骨架）/
+ *     ConnectorRegistry.gs（懒加载注册表）/ ProductivityConnector.gs /
+ *     ReminderConnector.gs / README.gs。
+ *   - Standard Connector Interface（九个方法：create/update/delete/get/
+ *     list/search/execute/health/capabilities）+ 统一响应DTO
+ *     （success/data/error/message/metadata/timestamp/duration/
+ *     traceId）+ 四类错误分类（VALIDATION/BUSINESS/SYSTEM/UNKNOWN_ERROR）
+ *     全部按需求方规格落地，用 Node vm 模块搭了个模拟 GAS 环境（stub
+ *     Logger/Utilities/Session + 假 ProductivityOS Library + 假共享
+ *     Tasks/Events 表）跑了 49 个 smoke test 全部通过（覆盖两个
+ *     Connector 的九个方法、各种成功/校验失败/业务失败路径，以及
+ *     Registry 的 register/get/invoke/healthCheckAll/capabilitiesAll，
+ *     含"动态注册一个未来才会有的 Domain OS"这个 Future Expansion 场景）。
+ *   - ⚠️ 落地过程中确认的两个 Domain OS 真实能力边界（不是本次引入的
+ *     限制，是核实代码后发现的既有事实，完整原因见
+ *     08_Connector/README.gs 五）：
+ *     (a) Productivity OS：DeleteTask 映射为 cancelTask()（软删除——
+ *         事件溯源架构没有硬删除操作）；ReopenTask 不支持（updateTask()
+ *         的 UPDATABLE_FIELDS 白名单里没有 status，也没有
+ *         TASK_REOPENED 事件类型）。
+ *     (b) Reminder OS：CreateReminder/UpdateReminder/DeleteReminder/
+ *         CompleteReminder/DismissReminder/SnoozeReminder/
+ *         TriggerReminder 七个操作在当前版本下均无对应后端能力可路由
+ *         ——Reminder OS v1.0 没有 Library/webhook（Constitution P2），
+ *         "提醒"不是独立实体，只是每小时扫 Tasks 表算出来的。这七个
+ *         操作诚实返回 BUSINESS_ERROR，不是漏做。
+ *     (c) 顺带核实确认（现有系统本来就有的行为，不是新问题）：
+ *         04_Main.gs 现有的 task_snooze: Telegram callback 目前只回复
+ *         确认文案，不改任何存储状态——"⏰ Snooze 1h"这个按钮背后没有
+ *         真实的延后逻辑。已同步记入下方"已知Bug/技术债"。
+ *   - 范围边界（刻意）：本次只新增 08_Connector/ 这一层基础设施，不
+ *     修改、不重构 04_Main.gs / 80_RiderConnector.gs /
+ *     21_InventoryModule.gs 里现有直接调 ProductivityOS Library 的
+ *     代码——这些既有调用点继续正常工作，行为完全不变。是否/何时把它们
+ *     迁移到走 ConnectorRegistry，是后续单独决定，见下方"下一步"。
  */
 
 // ============================================================
@@ -121,42 +392,64 @@
 // ============================================================
 
 /**
- * （暂无）
+ * - V3.0 + V3.1 迁移合并成一套，等待 Carson 在 GAS 编辑器里执行（步骤见
+ *   下方"下一步"）——这意味着本次v3.1新增的ActiveTasks/ArchiveTasks/锁/
+ *   告警等修复在代码层面已完成，但"线上是否已生效"取决于这次迁移是否跑完。
+ * - 07_StateEngine_TaskMetrics.gs 待合并进 07_StateEngine.gs（v2遗留，未处理）
+ * - MEDIUM RISK 2（Webhook同步链路过长）的处理方式待 Carson 决定：维持现状
+ *   （已有锁+去重缓存兜底数据安全） vs 改造成异步两段式回复。见"下一步"。
  */
 
 // ============================================================
-// 三、已知问题
+// 三、已知 Bug / 技术债
 // ============================================================
 
 /**
- * - 【持续存在，不是能单边修掉的 bug】MEDIUM RISK 1：Done/Snooze 按钮的
- *   callback_data 处理依赖 Personal AI Core 项目注册了 Telegram webhook、
- *   且用同一个 TELEGRAM_TOKEN 正确解析 task_done:/task_snooze: 协议。
- *   这次只做了文档约束（00_Project_Constitution.gs P6）和 webhook 注册
- *   状态的诊断（runDiagnostics()），但没法从 Reminder OS 这边验证 Core
- *   项目是否真的正确处理了这两种 callback_data——如果两边协议后续单方面
- *   改动，这里不会有任何自动报错，只能靠人工核对两边代码。
+ * - 93_MemoryEngine.gs 的 _isOverdueForMemory_ / _parseDueDateForMemory_
+ *   与 05_SheetUtils.gs 的 isOverdue_ / parseDueDate_ 逻辑重复
+ *   → 应合并，但93是只读引擎，不影响正确性，低优先级（历史遗留，本次未处理）
  *
- * - "接V3改EventBus.publish"这条旧 TODO：这次核实，代码（现
- *   2_Runtime/25_ReminderEngine.gs 的 _recordReminderSent，2026-07-06
- *   从 _updateReminderCount 改名，见 ADR-002）确实已经在调
- *   EventBus.publish('REMINDER_SENT', ...)。跟这条笔记本身的猜测一致——
- *   大概率是旧记录跟代码脱节（drift），不是真的还有未解决的部分。
- *   具体原意我这边没法进一步确认，如果 Carson 记得当时想解决的是什么、
- *   现在代码没覆盖到，可以更新/删掉这一条；不然可以考虑直接清掉。
+ * - 92_ReminderEngine.gs 尚未接入 EventBus.publish('REMINDER_SENT')，
+ *   仍用 _materializeTaskRow_ 安全兜底路径更新 reminder_count（历史遗留）。
+ *   连带影响：10_ProjectionEngine.gs 的 projectReminderSent_ 因此是死代码，
+ *   尚未加锁保护（v3.1的MEDIUM RISK 3修复范围内特别说明了这点）。
+ *   → 92接入V3那天，要同时给projectReminderSent_的read-modify-write补锁。
  *
- * - 【第二轮审计核实属实、决定不修，理由见 ADR-002「第二轮外部审计」】
- *   · MEDIUM RISK 1：EventBus 内存级去重在并发实例下确实会失效，但
- *     Reminder OS 自己不接 webhook、checkReminders 自身已被锁保护，
- *     这个具体并发场景在本项目不成立。对 Personal AI Core 那份副本
- *     可能更相关，但那个项目的代码看不到。
- *   · MEDIUM RISK 2：单一共享 Spreadsheet 的容量/隔离顾虑技术上成立，
- *     但这是 Constitution P1/P2 既有的架构决定，不是疏漏。改成多
- *     Spreadsheet 动态解析是影响全平台的架构变动，需要跨项目评估，
- *     不是能在 Reminder OS 一个项目里单方面改的。
- *   · LOW RISK 2：单聊限流对多用户的非必要阻塞，技术上成立，但
- *     Reminder OS 目前只服务单一 chat_id，没有"User B"可以被阻塞，
- *     实现差分限流是对不存在场景的过度设计。真的服务多用户时再做。
+ * - DeduplicationEngine 依赖 Tasks/Inventory Sheet 有 identity 列。
+ *   v3.2起：新装（跑setupSheets()）已经直接带identity/archived/status列，
+ *   不会再踩这个坑。仍然受影响的只是v3.2之前就已经setupSheets()过的
+ *   旧部署——这些部署的Tasks/Inventory还没有这些列，必须手动跑一次
+ *   migrateAddIdentityColumns()才会补上。跳过去重 = 退回v2行为，不会
+ *   崩溃，只是幂等保护暂时不生效。
+ *
+ * - ArchiveTasks 可能已经因为"archived列从未被migrateAddIdentityColumns
+ *   真正创建过"这个v3.2修复的bug（见上方2026-07-01记录的HIGH RISK 3关联
+ *   发现）积累了重复行（同一task_id出现多次，archived_at是不同日期）。
+ *   → 代码修复只解决"以后不再重复"，历史脏数据要不要清、怎么清由Carson
+ *   决定，没有自动处理（ArchiveTasks是append-only设计，不该自动删数据）。
+ *
+ * - 20/21模块的配置常数（v3.1已收进ProductivityConfig/InventoryConfig并
+ *   Object.freeze）+ 20/21/06/22模块本身仍是裸全局函数，未封装进IIFE。
+ *   → 完整封装是跨文件大重构（IdempotencyManager/ProjectionRebuilder/
+ *   RiderConnector等多处依赖这些函数是全局可调用的），本次只做了"消除
+ *   重复实现"和"冻结配置数组"两个风险点，完整IIFE封装列入"下一步"P2。
+ *
+ * - 09_IdempotencyManager.gs 与 20/21 模块双向硬编码耦合，不利于独立单元
+ *   测试（2026-07-01 LOW RISK 2核实属实，暂缓，理由见对应记录）。
+ *   → 列入"下一步"P2，跟"完整IIFE封装"一起做。
+ *
+ * - 09_TemporalParser.gs 的日期解析依赖脚本时区而非用户实际时区（2026-07-01
+ *   LOW RISK 1核实属实，暂缓，理由见对应记录）。
+ *   → 单人单时区部署下影响很小，多用户/跨时区场景出现前不启动。
+ *
+ * - 【2026-07-08 写 08_Connector/ReminderConnector.gs 时顺带核实确认，不是
+ *   新引入的问题】04_Main.gs 现有的 task_snooze: Telegram callback 目前
+ *   只回复一句确认文案，不改任何存储状态——Reminder OS 发出的"⏰ Snooze 1h"
+ *   按钮背后，系统里没有任何地方真正记录/使用"延后"这件事，任务会照常在
+ *   下一次 checkReminders() 扫描里被重新评估，效果等同于什么都没做。
+ *   对用户来说，点了按钮会以为提醒被推迟了，实际没有。
+ *   → 要不要做真正的 snooze（需要 Reminder OS 那边新增状态字段，见其
+ *   00_ADR_003 未采纳的 V2 方案），由 Carson 决定，列入"下一步"。
  */
 
 // ============================================================
@@ -164,60 +457,115 @@
 // ============================================================
 
 /**
- * 优先级 P2（这次改动留下的判断，建议过一遍）：
- *   1. REMINDER_ADVANCE_HOURS 默认给了 72 小时（3天），是 Claude 选的，
- *      不是从你的文档/代码反推出来的既定值——按你实际提醒习惯调整这个
- *      数字即可，不影响判断逻辑本身。
- *   2. 如果想要「CRITICAL 提前更久开始提醒、LOW 提前更短」这种按优先级
- *      分开的提前量（而不是现在的单一全局值），是个可以照
- *      REMINDER_INTERVAL_HOURS 结构做的小改动，这次按 bug 报告里描述的
- *      最小范围先没做（P6，不做额外扩展）。
- *   3. 这次 blueprint 重组里，21_SheetUtils.gs 和 25_ReminderEngine.gs
- *      都是横跨多个 blueprint 子分类、没有拆分成更小的文件——理由和具体
- *      考虑见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs，如果你希望拆得
- *      更细，可以再单独排。（25_ReminderEngine.gs 内部现在包进了 IIFE，
- *      物理文件数没变，见 00_ADR_002_ReminderEngine_Audit_Fixes.gs）
- *   4. Domain OS Blueprint 是跨项目的平台级约定，权威定义按惯例应该也记
- *      一份在 Personal AI Core 的 00_Project_Constitution.gs——这次没有
- *      该项目的文件，只更新了 Reminder OS 自己这份，需要的话把 Core 项目
- *      文件也发我，我再同步过去。
- *   5. 如果想彻底关掉 MEDIUM RISK 1（而不是只做文档约束+诊断），需要把
- *      Personal AI Core 项目里处理 task_done:/task_snooze: 这两种
- *      callback_data 的代码也发我核对，确认协议双方真的对齐——单看
- *      Reminder OS 这边的代码没法验证这件事。
- *   6. 1_Foundation/12_TemporalEngine.gs 现在没有任何调用方，是刻意的
- *      （见 00_ADR_003 Progression Rule），不是漏接。真的需要"每周一
- *      提醒我"这类 recurring 提醒时，下一步是 Phase B（Reminder
- *      Scheduler）——但要等到那时候再单独设计，不是现在顺手就接上。
+ * 优先级 P0（V3.0+V3.1 合并迁移，上线必须）：
+ *   1. 在 GAS 编辑器运行 migrateAddIdentityColumns()
+ *      （给Tasks加identity+archived列；给Inventory加identity+status列；
+ *       给ActiveTasks/ArchiveTasks补全列——后两张表理论上setupSheets()已经
+ *       建好完整表头，这一步主要是给Tasks/Inventory这两张有旧数据的表用）
+ *   2. 运行 setupSheets()（如果还没建过ActiveTasks/ArchiveTasks两张新表，
+ *      这一步会自动建好；已建过的不受影响，幂等）
+ *   3. 运行 rebuildAllProjections()（重建Tasks/Inventory/ActiveTasks三张
+ *      Read Model，让历史Events数据正确反映到新结构里）
+ *   4. 运行 createTriggers()（重新挂全部4个定时触发器，包含新增的
+ *      triggerDailyArchive）
+ *   5. 运行 verifyProjection() 确认一致性（v3.1新增了ActiveTasks一致性
+ *      校验段）
+ *   6. Telegram 测试清单：
+ *      - 发同一条任务两次 → 第二次应回复"任务已存在"而非新建
+ *      - 发 "/help" 和 "我的任务" → 不应该被建成任务，应正确响应
+ *      - 发 "加了3个苹果和5个香蕉" → 应只记录"苹果"，并提示"香蕉"未记录
+ *      - 完成一个任务后发 "我的任务" → 应该立刻从列表消失（验证ActiveTasks
+ *        实时同步）
+ *      - 发 "/history" 和 "/archive" → 分别看到近期完成 vs 更早归档记录
+ *      - 【v3.2新增】发 "提醒我每个月25号交房租"，done掉这次 → 完成回复里
+ *        应该看到"🔁 已自动创建下一次"，且发 "我的任务" 能看到新生成的
+ *        下个月那条（验证Recurring Task自动续期）
+ *   7. 【v3.2新增，如果这个部署之前已经跑过一段时间triggerDailyArchive】
+ *      检查 ArchiveTasks 是否有重复行（同一task_id、不同archived_at）——
+ *      v3.2之前archived列从未被真正创建过，冷归档可能每天重复搬运了同一批
+ *      任务，见"已知Bug"。要不要清、怎么清由你决定。
  *
- * 优先级 P3（架构演进）：
- *   7. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
- *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
- *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
- */
-
-// ============================================================
-// 五、长期方向（讨论中，非既定计划）
-// ============================================================
-
-/**
- * Current: V1（单一 ReminderEngine，只认 due_date + priority 这一种规则
- *          形状，2026-07-06 完成 HIGH/MEDIUM/LOW 六项审计修复后的版本）
- *          + Phase A（Temporal Engine，通用日期规则计算，1_Foundation/
- *          12_TemporalEngine.gs，已实现，39项测试全部通过）——但 Phase A
- *          目前【没有任何东西在调用它】，V1 的实际提醒逻辑
- *          （25_ReminderEngine.gs）完全没有改动，跟 Temporal Engine
- *          还没有任何连接。
- * Future:  Phase B（Reminder Scheduler）——把 Temporal Engine 接到
- *          Reminder OS 自己的 recurring 提醒场景，让"每周一提醒我"这类
- *          规则真正能用
- * Status:  Phase A = Done（Contract + 实现 + 测试）。Phase B = 未开始，
- *          按 Progression Rule，不因为 Phase A 做完就自动开始，需要先
- *          有实际需求驱动
+ * 优先级 P1（需要 Carson 决策，不属于"纯代码bug"）：
+ *   8. MEDIUM RISK 2（2026-06-29编号）：是否要把Webhook同步链路改成"先回
+ *      200 OK，Projection/发消息异步化"？当前已有锁+去重缓存保护数据
+ *      正确性，这是纯UX/延迟层面的取舍（改了之后会变成"收到处理中"+
+ *      稍后第二条消息，而不是一次性立刻回复）。
  *
- * 完整构想、评估、Phase A→F 路线图、Progression Rule、Exit Criteria，
- * 见 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs；Phase A 的具体
- * Contract，见 00_ADR_004_Temporal_Engine_Design.gs。不在这里重复列出。
- * 这一节只保证一件事：Current 里写了什么，就真的有对应的 .gs 文件和
- * 测试；没写的（Phase B 及之后），就真的还没有一行代码。
+ * 优先级 P2（下一个迭代）：
+ *   9.【2026-07-03 已随拆分移交】92_ReminderEngine.gs 现在是 Reminder OS
+ *      独立项目，"接V3改EventBus.publish('REMINDER_SENT')"这件事在拆分时
+ *      核实：代码其实已经在调 EventBus.publish('REMINDER_SENT',...)了
+ *      （_updateReminderCount 里），这条 TODO 本身可能是旧记录跟代码脱节
+ *      （drift）——不确定原意是不是指别的事，去 Reminder OS 项目自己的
+ *      00_Project_State.gs（如果建了的话）或者直接看
+ *      92_ReminderEngine.gs 现在的代码确认。projectReminderSent_ 补锁的
+ *      部分还没做，如果还需要，去 Reminder OS 项目排期。
+ *   10.【2026-07-03 已完成】07_StateEngine_TaskMetrics.gs 改名——拆分时
+ *      顺手在三个新项目里都统一改成了正确的文件名 07_IdentityEngine.gs
+ *      （不是"合并入07_StateEngine.gs"，那个合并目标本身也是旧的、跟
+ *      实际代码内容不符的记录——文件内容一直是 IdentityEngine，不是
+ *      StateEngine，见 2026-07-01 LOW RISK 2 的原始描述）。
+ *   11. 93_MemoryEngine.gs 的重复工具函数合并进 05_SheetUtils.gs
+ *   12.【2026-07-03 部分改变】20/06 现在是 Productivity OS 项目的文件，
+ *      21/22 仍在 Core。IIFE 封装 + public API 设计这件事在两个项目里
+ *      都还没做（拆分只是物理搬文件+按需要加 Bridge 前缀，没有顺带做
+ *      IIFE 重构）。原来说的"09_IdempotencyManager.gs 与20/21模块的
+ *      双向硬编码耦合"现在的形态变了：Core 的 09（Inventory 部分）
+ *      仍然耦合 21 的裸全局函数（未变）；Productivity OS 的 09（Task
+ *      部分）耦合 20 的裸全局函数，但这俩现在在【同一个项目】里，耦合
+ *      范围反而更小了（不会被其他项目直接摸到）。IIFE 封装本身要做的话，
+ *      按项目分别排期：Core 排 21/22，Productivity OS 排 06/20。
+ *   13. "Today Dashboard"（🔥今天/⚠️已逾期/📅明天/📦Shopping/🚗Vehicle 分组
+ *       视图）——Carson已确认归入future，等ActiveTasks/ArchiveTasks稳定后再做
+ *       （现在 ActiveTasks/ArchiveTasks 归 Productivity OS 项目管）
+ *   14. 09_TemporalParser.gs 改用per-chat时区偏好而非脚本默认时区
+ *       （2026-07-01 LOW RISK 1）——单人单时区部署下影响很小，真的出现
+ *       多用户/跨时区场景需求时再启动，不是为了做而做。
+ *       ⚠️ 2026-07-03 拆分后这个文件在 Core 和 Productivity OS 各有一份
+ *       （纯函数，见 Constitution D3 的 Identity 支柱说明），真要改时区
+ *       逻辑，两份都要改，别只改一份。
+ *   15. MEDIUM RISK 1（2026-07-01编号，02_EventBus.gs getAllEvents）：
+ *       如果Events历史增长到/insights出现可观测延迟（先加Logger.log计时
+ *       确认，不要凭感觉判断"是不是慢了"），真正的修复方向是把93_MemoryEngine
+ *       的聚合从"每次全量重放Events"改成"增量维护的聚合表"（类似
+ *       ActiveTasks的实时维护思路），不是简单加个时间窗口参数——后者会
+ *       破坏insight_alltime和pattern_90d两个功能，理由见2026-07-01记录。
+ *
+ * 优先级 P3（架构演进，遵循 00_Project_Constitution.gs 二/平台架构的
+ *          三层标准：Level 1 Platform / Level 2 Domain OS / Level 3
+ *          Engine，P6.2 = Level 2+3）：
+ *   16.【2026-07-03 改写】Procurement OS（原 Shopping OS）/ Inventory OS
+ *       ——两者都已在独立开发中，不再规划"共享 Core Identity Registry"式
+ *       的深度集成（原方案作废）。Personal AI Core 这边的范围收窄为：
+ *       只建 Connector（参照 80_RiderConnector.gs 的 Bridge 模式，单向
+ *       只读/触发，命名 82_ProcurementConnector.gs /
+ *       83_InventoryConnector.gs），不拥有它们的完整业务逻辑，不共享
+ *       Identity。现有 21_InventoryModule.gs / 22_InventoryIntentParser.gs
+ *       （V1）暂不动，继续在 Core 内运作，退役时机跟 Inventory OS V2 +
+ *       对应 Connector 的就绪时间挂钩，不是现在。详见
+ *       00_Project_Constitution.gs 二/平台架构 D2、D7。
+ *       【2026-07-08 补充】08_Connector/ 统一 Connector Layer（D5(3)）
+ *       落地后，这两个未来 Connector 也可以选择实现 Standard Connector
+ *       Interface（跟 ProductivityConnector.gs 一样的九个方法+统一响应
+ *       DTO），放进 08_Connector/ 目录、经 ConnectorRegistry 注册，
+ *       而不是照抄 80_RiderConnector.gs 的裸全局函数风格——两种做法都
+ *       符合 D5(1) 的 Bridge 规则，选哪种是风格决定，不是本条目前强制。
+ *   17. Property OS / Finance OS —— 这两个仍按"归 Core 治理"的 Domain OS
+ *       规划（不是 External System），遵循 Level 2 Domain OS Standard
+ *       + D6 Blueprint 从零搭建。
+ *       【2026-07-08 补充】这两个未来落地时，Core 侧的调用应该直接实现
+ *       为新的 NN_XxxConnector.gs 放进 08_Connector/、经
+ *       ConnectorRegistry 注册（D5(3)），不需要再另外设计一套接口——
+ *       ProductivityConnector.gs 是 Library 形态集成的参照范本，
+ *       ReminderConnector.gs 是共享 Sheet/无 Library 形态集成的参照
+ *       范本，两种真实前例都已经有了。
+ *   18.【2026-07-08 新增】04_Main.gs / 80_RiderConnector.gs /
+ *       21_InventoryModule.gs 现有直接调 ProductivityOS Library
+ *       （ProductivityOS.createTask() 等）的代码，要不要迁移成改走
+ *       ConnectorRegistry.get('Productivity').xxx()，由 Carson 决定，
+ *       本次 08_Connector/ 落地时特意没有动这几个文件——它们现在的写法
+ *       仍然正确、仍然工作，迁移纯粹是"统一调用风格"层面的收益，不是
+ *       修复 bug，不着急。真要迁移，建议顺序：先 80_RiderConnector.gs
+ *       （调用点最少，风险最低），再 04_Main.gs，21_InventoryModule.gs
+ *       涉及的是 Inventory 而不是 Task/Reminder，本来就不该改。
  */

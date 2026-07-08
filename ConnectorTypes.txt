@@ -1,0 +1,274 @@
+/**
+ * ConnectorTypes.gs
+ * Personal AI Core — Connector Layer / 共用类型、错误分类、执行骨架
+ *
+ * 【新增文件】Connector Layer V1 落地的一部分，完整背景/架构见本目录
+ * README.gs，决策记录见 00_Project_Constitution.gs 二/平台架构 D5(3)。
+ *
+ * 本文件是整个 Connector Layer 的"共用词汇表"，四类内容：
+ *   1. ConnectorNames         —— Registry 用来注册/查找 connector 的标准名字
+ *   2. ConnectorErrorCategory —— 四种标准错误分类（需求方规格明确要求）
+ *   3. ConnectorError / ConnectorErrors —— 内部信号异常类 + 工厂函数，
+ *      各 Connector 方法体内 throw 这个，不 throw 裸 Error/裸字符串
+ *   4. ConnectorValidation    —— 通用输入校验小工具（只做"形状对不对"，
+ *      不做任何业务规则判断——业务规则判断永远留在 Domain OS 那一侧）
+ *   5. ConnectorSupport.handle —— 每个 Connector 公开方法的标准执行骨架：
+ *      计时 + try/catch + 错误分类 + 日志（不含业务数据）+ 组装
+ *      ConnectorResponse。这是"Connector 不能抛裸异常"这条硬性要求在
+ *      代码层面的唯一落地点——写在这里一次，两个 Connector 共用，避免
+ *      同样的 try/catch/计时/日志样板代码在 ProductivityConnector.gs 和
+ *      ReminderConnector.gs 里各写一份、未来改动只改了一份（犯
+ *      00_Project_Constitution.gs C5 同类问题）。
+ *
+ * 依赖：ConnectorResponse.gs（仅 ConnectorSupport.handle 用到，且是在
+ * handle() 被调用的那一刻才引用，不是在本文件自己的 IIFE 构造时引用——
+ * 所以两个文件在 Apps Script 项目里谁先加载都不会报错，不依赖 GAS 的
+ * 文件字母序加载顺序。这一点刻意为之，理由见 05_SheetUtils.gs 里
+ * _cleanTitle_ 那段真实发生过的"后加载覆盖先加载"教训——本层新增代码要
+ * 吸取那次教训，不要制造新的加载顺序依赖）。
+ */
+
+// ============================================================
+// 一、ConnectorNames —— Registry 注册名字的唯一权威来源
+// ============================================================
+
+/**
+ * Registry 和两个 Connector 文件都从这里取名字，不在各自文件里各写一遍
+ * 字符串字面量——避免打错字导致 Registry 查不到、Connector 自己不知道
+ * 自己叫什么这种低级问题。
+ */
+var ConnectorNames = Object.freeze({
+  PRODUCTIVITY: 'Productivity',
+  REMINDER:     'Reminder'
+});
+
+// ============================================================
+// 二、ConnectorErrorCategory —— 四种标准错误分类（需求方规格）
+// ============================================================
+
+var ConnectorErrorCategory = Object.freeze({
+  VALIDATION_ERROR: 'VALIDATION_ERROR', // 输入形状/必填项不对，Domain OS 根本没被调用
+  BUSINESS_ERROR:   'BUSINESS_ERROR',   // 输入形状没问题，但 Domain OS
+                                        // 判断这个请求做不到（不存在/不支持）
+  SYSTEM_ERROR:     'SYSTEM_ERROR',     // 基础设施层面的问题（Library 没挂/
+                                        // Sheet 读不到/锁超时等），不是业务判断
+  UNKNOWN_ERROR:    'UNKNOWN_ERROR'     // 兜底：捕获到的异常不属于以上任何一类
+});
+
+// ============================================================
+// 三、ConnectorError —— 内部信号异常 + 工厂函数
+// ============================================================
+
+/**
+ * 各 Connector 方法体内应该 throw 这个类的实例（通过下面 ConnectorErrors
+ * 的工厂函数创建），不要 throw 裸 new Error(...)——ConnectorSupport.handle
+ * 的 catch 块靠 instanceof 识别它，从而知道这是"我方法自己判断出的、已分类
+ * 好的错误"，而不是"调用 Domain OS 时冒出来的、需要归类成 SYSTEM/UNKNOWN
+ * 的意外异常"。
+ *
+ * @param {string} category  ConnectorErrorCategory 四选一
+ * @param {string} code      具体错误码
+ * @param {string} message   人类可读说明
+ * @param {any}    [details] 结构化补充信息（不放敏感/业务数据）
+ */
+function ConnectorError(category, code, message, details) {
+  this.name     = 'ConnectorError';
+  this.category = category;
+  this.code     = code;
+  this.message  = message;
+  this.details  = (details === undefined) ? null : details;
+}
+ConnectorError.prototype = Object.create(Error.prototype);
+ConnectorError.prototype.constructor = ConnectorError;
+
+var ConnectorErrors = Object.freeze({
+  validation: function (code, message, details) {
+    return new ConnectorError(ConnectorErrorCategory.VALIDATION_ERROR, code, message, details);
+  },
+  business: function (code, message, details) {
+    return new ConnectorError(ConnectorErrorCategory.BUSINESS_ERROR, code, message, details);
+  },
+  system: function (code, message, details) {
+    return new ConnectorError(ConnectorErrorCategory.SYSTEM_ERROR, code, message, details);
+  },
+  unknown: function (code, message, details) {
+    return new ConnectorError(ConnectorErrorCategory.UNKNOWN_ERROR, code, message, details);
+  }
+});
+
+// ============================================================
+// 四、ConnectorValidation —— 通用输入校验（只判形状，不判业务规则）
+// ============================================================
+
+/**
+ * ⚠️ 边界说明：这里只放"这是不是一个非空字符串/是不是一个纯对象"这种
+ * 跟任何 Domain OS 业务规则都无关的结构性检查。诸如"category 必须是
+ * MAINTENANCE/SHOPPING/.../PROJECT 之一"这种规则属于 Productivity OS
+ * 自己的 UPDATABLE_FIELDS/TASK_CATEGORIES 白名单，不允许在这里（或任何
+ * Connector 里）重复定义——那是业务逻辑，且一旦 Domain OS 改了白名单，
+ * 这里会静默漂移出一份过期副本（00_Project_Constitution.gs C5 禁止的
+ * 重复实现）。Connector 对这类规则的态度是：原样转发给 Domain OS 自己
+ * 判断，Domain OS 已经会正确地忽略/拒绝不合法的值。
+ */
+var ConnectorValidation = Object.freeze({
+  isNonEmptyString: function (v) {
+    return typeof v === 'string' && v.trim().length > 0;
+  },
+  isPlainObject: function (v) {
+    return !!v && typeof v === 'object' && !Array.isArray(v);
+  },
+  isNonEmptyPlainObject: function (v) {
+    return ConnectorValidation.isPlainObject(v) && Object.keys(v).length > 0;
+  },
+  isStringOrPlainObject: function (v) {
+    return typeof v === 'string' || ConnectorValidation.isPlainObject(v);
+  }
+});
+
+// ============================================================
+// 五、ConnectorSupport —— 标准执行骨架（计时/try-catch/分类/日志/组装）
+// ============================================================
+
+var ConnectorSupport = (function () {
+
+  /**
+   * traceId 生成规则跟 02_EventBus.gs 的 _generateEventId_() 同一个风格
+   * （前缀 + 时间戳 + 随机数），沿用现成惯例，不另创一套格式。
+   */
+  function generateTraceId() {
+    return 'TRC-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
+  }
+
+  /**
+   * 日志：只记录 Connector 名 / 方法 / action / 耗时 / traceId / 成功还是
+   * 失败 / 错误码——明确不打印 data（业务数据本体）。这是需求方
+   * "Logging" 一节"No business data inside logs"的唯一落地点，两个
+   * Connector 共用，不用各自记得"这次也要注意别打业务数据"。
+   *
+   * @param {object} meta   { connector, method, action, chatId }
+   * @param {object} outcome { success, durationMs, traceId, errorCode }
+   */
+  function _log(meta, outcome) {
+    var line = '[Connector:' + meta.connector + '] ' +
+      'method=' + meta.method +
+      (meta.action ? ' action=' + meta.action : '') +
+      ' chatId=' + (meta.chatId ? String(meta.chatId) : '(none)') +
+      ' success=' + outcome.success +
+      ' durationMs=' + outcome.durationMs +
+      ' traceId=' + outcome.traceId +
+      (outcome.errorCode ? ' errorCode=' + outcome.errorCode : '');
+    Logger.log(line);
+  }
+
+  /**
+   * 每个 Connector 公开方法（create/update/delete/get/list/search/execute/
+   * health/capabilities）的方法体应该整体包一层这个函数，不要自己手写
+   * try/catch——保证：
+   *   (a) 无论 worker 内部 throw 什么，最终返回值永远是
+   *       ConnectorResponse.success()/failure() 的形状，绝不把裸异常
+   *       甩给调用方（需求方"Error Handling"一节的硬性要求）；
+   *   (b) 每次调用都会被记一条不含业务数据的日志；
+   *   (c) duration/traceId 统一计算，两个 Connector 数字口径一致。
+   *
+   * @param {object} meta                  { connector, method, action?, chatId? }
+   * @param {function(): {data, message?, metaExtra?}} worker
+   *        实际业务代码。约定：
+   *          - 正常完成：return { data, message?, metaExtra? }
+   *          - 校验/业务/系统层面判定失败：throw 一个 ConnectorErrors.*() 产出的错误
+   *          - 真正意料之外的异常（比如 Domain OS 内部报错、Sheet 读取失败且
+   *            没有被 worker 自己 catch）：直接让它往上抛，本函数会兜底分类成
+   *            SYSTEM_ERROR/UNKNOWN_ERROR
+   * @returns {object} 标准 ConnectorResponse 形状
+   */
+  function handle(meta, worker) {
+    var start = Date.now();
+    var traceId = generateTraceId();
+    var baseMetadata = {
+      connector: meta.connector,
+      method:    meta.method,
+      action:    meta.action || null,
+      chatId:    meta.chatId || null
+    };
+
+    try {
+      var result = worker() || {};
+      var duration = Date.now() - start;
+
+      _log(meta, { success: true, durationMs: duration, traceId: traceId });
+
+      var mergedMetadata = _mergeMetadata(baseMetadata, result.metaExtra);
+      return ConnectorResponse.success(
+        (result.data === undefined) ? null : result.data,
+        {
+          message:   result.message || 'OK',
+          metadata:  mergedMetadata,
+          duration:  duration,
+          traceId:   traceId
+        }
+      );
+
+    } catch (err) {
+      var duration2 = Date.now() - start;
+      var classified = _classifyError(err);
+
+      _log(meta, {
+        success:    false,
+        durationMs: duration2,
+        traceId:    traceId,
+        errorCode:  classified.code
+      });
+
+      return ConnectorResponse.failure(classified, {
+        metadata: baseMetadata,
+        duration: duration2,
+        traceId:  traceId
+      });
+    }
+  }
+
+  function _mergeMetadata(base, extra) {
+    if (!extra || typeof extra !== 'object') return base;
+    var merged = shallowCopy_(base); // 05_SheetUtils.gs 共用工具，Core 项目本来就有
+    for (var k in extra) merged[k] = extra[k];
+    return merged;
+  }
+
+  /**
+   * 把 catch 到的任何东西归到四类标准错误分类之一。
+   *  - ConnectorError 实例（各 Connector 自己 throw 的）→ 直接用它自带的分类
+   *  - GAS/JS 原生 Error → SYSTEM_ERROR（多数情况下是 Sheet/Library/锁这类
+   *    基础设施调用抛出来的，比如 05_SheetUtils.gs 的 getSheet_ 在表不存在
+   *    时 throw new Error(...)）
+   *  - 其他任何东西（字符串、undefined、非 Error 对象）→ UNKNOWN_ERROR，
+   *    这是最保守的兜底，不擅自替它归类成"系统性"问题
+   */
+  function _classifyError(err) {
+    if (err instanceof ConnectorError) {
+      return {
+        category: err.category,
+        code:     err.code,
+        message:  err.message,
+        details:  err.details
+      };
+    }
+    if (err instanceof Error) {
+      return {
+        category: ConnectorErrorCategory.SYSTEM_ERROR,
+        code:     'UNEXPECTED_SYSTEM_ERROR',
+        message:  err.message,
+        details:  null
+      };
+    }
+    return {
+      category: ConnectorErrorCategory.UNKNOWN_ERROR,
+      code:     'UNEXPECTED_EXCEPTION',
+      message:  (err && err.toString) ? err.toString() : 'An unrecognized error value was thrown.',
+      details:  null
+    };
+  }
+
+  return {
+    generateTraceId: generateTraceId,
+    handle:           handle
+  };
+})();
