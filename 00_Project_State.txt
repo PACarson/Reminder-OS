@@ -5,8 +5,11 @@
  * ⚠️ 快照，不是日志。
  * LAST_UPDATED: 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
  * Blueprint 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换
- * 确认；修复本轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、LOW RISK 1/2
- * 共6项；完成 Phase A（Temporal Engine）Contract 设计 + 实现 + 测试。
+ * 确认；修复第一轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、
+ * LOW RISK 1/2 共6项；完成 Phase A（Temporal Engine）Contract 设计+
+ * 实现+测试；修复第二轮外部审计的 HIGH/MEDIUM/LOW RISK 各两项，并发现
+ * 修复一个更严重的既有 bug（last_reminder_at 从未被写入，提醒频率控制
+ * 实际从未生效）。
  */
 
 // ============================================================
@@ -84,6 +87,33 @@
  *   目前只有 Temporal Engine 一个 Foundation 新模块，"所有 Foundation
  *   模块都要遵守"这句话现在只有一个真实案例支撑，属于 Progression Rule
  *   要避免的"为还不存在的未来模块预先定规则"，理由见 ADR-004。
+ *
+ * - 2026-07-06：修复第二轮外部审计对 25_ReminderEngine.gs/20_EventBus.gs/
+ *   21_SheetUtils.gs 的发现（HIGH/MEDIUM/LOW 各两条），完整依据见
+ *   00_ADR_002_ReminderEngine_Audit_Fixes.gs 的「第二轮外部审计」章节：
+ *   · HIGH RISK 1（新）：checkReminders 的批量写延后到循环结束，如果
+ *     执行因超时被打断，批量写永远不会执行——这是上一轮 HIGH RISK 1
+ *     修复本身带来的新风险。加了时间预算机制，接近6分钟上限就提前
+ *     中断循环，但中断前已处理的任务仍然保证批量写入。
+ *   · HIGH RISK 2（新）：_sendReminder 之前丢弃了 Output.sendMessage
+ *     的返回值，发送失败时依然照常更新提醒状态，造成静默丢失。改成
+ *     只有确认发送成功才更新状态。
+ *   ⚠️【意外发现，不在审计报告里，写回归测试时自己测出来的、影响比
+ *   这轮任何一条审计发现都大】_recordReminderSent 从最早的版本开始就
+ *   只更新了 reminder_count，从来没有设置过 last_reminder_at——导致
+ *   REMINDER_INTERVAL_HOURS 按优先级分级的提醒间隔（4/6/12/24小时）
+ *   实际上从来没有生效过，所有任务只要满足提醒条件，每小时触发器跑
+ *   一次就会重发一次。已修复，并新增"连续跑两次checkReminders，第二次
+ *   不应该重发"的回归测试验证。
+ *   · LOW RISK 1（新）：21_SheetUtils.gs 包进 IIFE（是最后一个还没
+ *     IIFE 化的"引擎风格"文件），22_QueryEngine.gs/25_ReminderEngine.gs
+ *     的调用方式同步改成 SheetUtils.xxx 命名空间形式。
+ *   MEDIUM RISK 1（新）、MEDIUM RISK 2（新）、LOW RISK 2（新）核实
+ *   属实但决定不修，理由见「已知问题」。
+ *   新写 5 组端到端测试（发送失败/发送成功/时间预算耗尽/部分处理后
+ *   耗尽预算仍保证已处理部分落盘/单任务异常不拖累整批），加上
+ *   "连续两次执行"的回归测试，第一轮遗留的全部测试（8个原始场景+
+ *   TemporalEngine 39个+EventBus缓存验证）一并重跑确认无回归。
  */
 
 // ============================================================
@@ -114,6 +144,19 @@
  *   大概率是旧记录跟代码脱节（drift），不是真的还有未解决的部分。
  *   具体原意我这边没法进一步确认，如果 Carson 记得当时想解决的是什么、
  *   现在代码没覆盖到，可以更新/删掉这一条；不然可以考虑直接清掉。
+ *
+ * - 【第二轮审计核实属实、决定不修，理由见 ADR-002「第二轮外部审计」】
+ *   · MEDIUM RISK 1：EventBus 内存级去重在并发实例下确实会失效，但
+ *     Reminder OS 自己不接 webhook、checkReminders 自身已被锁保护，
+ *     这个具体并发场景在本项目不成立。对 Personal AI Core 那份副本
+ *     可能更相关，但那个项目的代码看不到。
+ *   · MEDIUM RISK 2：单一共享 Spreadsheet 的容量/隔离顾虑技术上成立，
+ *     但这是 Constitution P1/P2 既有的架构决定，不是疏漏。改成多
+ *     Spreadsheet 动态解析是影响全平台的架构变动，需要跨项目评估，
+ *     不是能在 Reminder OS 一个项目里单方面改的。
+ *   · LOW RISK 2：单聊限流对多用户的非必要阻塞，技术上成立，但
+ *     Reminder OS 目前只服务单一 chat_id，没有"User B"可以被阻塞，
+ *     实现差分限流是对不存在场景的过度设计。真的服务多用户时再做。
  */
 
 // ============================================================

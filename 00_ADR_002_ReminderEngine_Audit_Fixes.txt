@@ -121,4 +121,130 @@
  * - MEDIUM RISK 1 严格来说没有被"消除"，只是被"文档化+加了诊断"——这是
  *   本次 6 项里唯一一条本质上无法在 Reminder OS 单个项目内彻底解决的，
  *   如实记录在 00_Project_State.gs「已知问题」，不假装它已经修好了。
+ *
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 第二轮外部审计（2026-07-06，针对第一轮修复之后的代码）
+ * ══════════════════════════════════════════════════════════════
+ *
+ * 背景：第一轮的 HIGH RISK 1 修复（批量写替代逐任务写）本身又被第二轮
+ * 审计发现了新问题——批量写延后到循环结束才做，如果循环本身因为超时被
+ * 打断，批量写永远不会执行。这是"修一个问题、引入另一个问题"的典型
+ * 案例，第二轮的核实过程本身也是对第一轮方案的检验。
+ *
+ * === 逐条核实 + 处理 ===
+ *
+ * HIGH RISK 1（新）：执行超时导致批量写永远不执行，造成重复推送
+ *   核实：属实，而且是第一轮 HIGH RISK 1 修复本身带来的新风险，不是
+ *   独立于第一轮的问题。GAS 6 分钟硬上限 + Utilities.sleep(1000) 节流
+ *   累积耗时，待发送任务一多，撞超时的概率就会实际存在。
+ *   修复：checkReminders 从 forEach 改成 for 循环，加入时间预算
+ *   （EXECUTION_TIME_BUDGET_MS=5分钟，留1分钟安全余量），每次处理前
+ *   检查已耗时，接近预算就 break——但 break 之后依然执行批量写入，
+ *   已处理的部分保证落盘。剩余任务留给下一次触发器，这是安全的（它们
+ *   本来就还没发送成功）。
+ *
+ * HIGH RISK 2（新）：Output.sendMessage 失败时状态被静默错误更新
+ *   核实：属实。_sendReminder 之前完全丢弃了 Output.sendMessage 的
+ *   返回值，导致发送失败（网络异常/Telegram拒绝/token或chat_id失效）时
+ *   系统依然照常累加 reminder_count，造成静默丢失且不会重试。
+ *   修复：_sendReminder 改为返回结果；checkReminders 只在
+ *   sendResult.ok 为真时才调用 _recordReminderSent、才收进批量写入
+ *   列表。
+ *
+ * 【意外发现，不在这轮审计报告里，是写回归测试时自己测出来的】
+ * _recordReminderSent（原_updateReminderCount）从最早的版本开始就只
+ * 更新了 reminder_count，从来没有设置过 task.last_reminder_at——而
+ * _shouldRemind 判断"距上次提醒是否超过间隔小时数"完全依赖这个字段。
+ * 字段永远是空的，意味着 REMINDER_INTERVAL_HOURS 那套按优先级分级的
+ * 提醒间隔（4/6/12/24小时）实际上从来没有生效过，所有任务只要满足
+ * 提醒条件，每小时触发器跑一次就会重发一次。已经在 25_ReminderEngine.gs
+ * 补上赋值，并写了"连续跑两次 checkReminders，第二次不应该重发"的
+ * 回归测试验证。这个发现比这轮审计报告里任何一条的实际影响都大，因为
+ * 它意味着提醒频率控制这个核心功能从一开始就没真正工作过，只是恰好
+ * 没被之前几轮审计和我自己第一轮的测试用例覆盖到（之前的测试都是直接
+ * 手动设置 last_reminder_at 来测 _shouldRemind 的判断逻辑本身，没有
+ * 端到端验证过"发送成功之后这个字段真的会被写回 Sheet"这一步）。
+ *
+ * MEDIUM RISK 1（新）：EventBus 内存级去重在并发实例下失效
+ *   核实：技术判断本身正确——_inExecIdentityCache_ 确实是单次执行的
+ *   内存缓存，并发实例之间不共享，这个描述没有问题。
+ *   但核实这个风险在 Reminder OS 这个项目里是否真的可能发生：
+ *   Reminder OS 自己"不接 Telegram webhook"（Constitution P2），审计
+ *   描述的"用户连续快速双击 Done/Snooze 按钮导致并发 webhook 回调"这个
+ *   场景，处理 webhook 的是另一个项目（Personal AI Core），不是这里。
+ *   Reminder OS 自己唯一会调 EventBus.publish 的地方是 checkReminders
+ *   内部，而 checkReminders 本身已经被 LockService 互斥锁保护（不会
+ *   有两个 checkReminders 并发跑），所以这个具体的并发场景在 Reminder
+ *   OS 这份代码里目前不成立。
+ *   决定不在这里实现建议的 CacheService+分布式锁方案——这是为一个当前
+ *   不存在的执行路径加复杂度，违反 P6。这个发现对"如果 Personal AI
+ *   Core 那份 EventBus.gs 副本也有类似的并发 publish 场景"更有意义，
+ *   但那个项目的代码这次看不到，没法代为验证或修改。
+ *
+ * MEDIUM RISK 2（新）：单一共享 Spreadsheet 的容量/隔离风险
+ *   核实：技术上是对的顾虑（Google Sheets 确实有单表容量上限），但
+ *   "一张共享 Spreadsheet、每个 Domain OS 各自一个分页"不是疏漏，是
+ *   00_Project_Constitution.gs P1/P2 在 2026-07-03 拆分时就明确写下的
+ *   既有架构决定。改成"每个 Domain OS 各自的 Spreadsheet、动态解析
+ *   ID"是一次影响整个 Personal AI 平台的架构级变动，会牵动这次看不到
+ *   代码的 Personal AI Core、Productivity OS 等其他项目，不是能在
+ *   Reminder OS 这一个项目里单方面决定并且改掉的事，需要跨项目评估。
+ *   没有在这里改，见 00_Project_State.gs「已知问题」。
+ *
+ * LOW RISK 1（新）：SheetUtils 全局作用域暴露，跟已 IIFE 化的其他文件
+ * 不一致
+ *   核实：属实。21_SheetUtils.gs 是目前唯一还平铺在全局的"引擎风格"
+ *   文件（22_QueryEngine.gs/40_Output.gs/20_EventBus.gs/
+ *   25_ReminderEngine.gs 都已经是 IIFE 模块）。
+ *   修复：包进 IIFE（SheetUtils 模块），对外暴露 SheetUtils.getSheet_
+ *   等11个函数。跟 25_ReminderEngine.gs 的 MEDIUM RISK 2 修复不同的是，
+ *   SheetUtils 的函数本来就是设计给其他文件跨文件调用的共用工具（不像
+ *   ReminderEngine 的内部函数只在自己文件内用），所以这次 IIFE 化必须
+ *   同步更新调用方——22_QueryEngine.gs（getSheet_/getHeaderMap_）和
+ *   25_ReminderEngine.gs（isOverdue_/parseDueDate_/
+ *   batchUpsertRowsByKey_）的裸调用全部改成 SheetUtils.xxx。函数内部
+ *   互相调用（比如 upsertRowByKey_ 调 getSheet_）因为都在同一个 IIFE
+ *   闭包里，不需要加前缀。
+ *
+ * LOW RISK 2（新）：单聊限流对多用户场景的非必要阻塞
+ *   核实：技术上成立，但 Reminder OS 目前实际服务的是单一 chat_id
+ *   （Steven 自己），"User A 的提醒阻塞 User B"这个场景现在没有 User B
+ *   可以被阻塞。实现"按 chat_id 分组、只对同一 chat_id 连续发送才节流"
+ *   需要额外的分组/排序逻辑，对当前不存在的场景做这个复杂度是过度设计
+ *   （P6）。真的服务多个不同 chat_id 的用户时，这个优化才有实际意义，
+ *   到时候再做，见 00_Project_State.gs「已知问题」。
+ *
+ * === 第二轮验证方式 ===
+ *
+ * 新写了 5 组针对性测试（mock 完整的 GAS 环境，加载真实的
+ * 21_SheetUtils.gs/20_EventBus.gs/22_QueryEngine.gs/25_ReminderEngine.gs
+ * 四个文件一起跑，不是孤立测试单个函数）：
+ *   1. 发送失败不应更新任何状态（HIGH RISK 2）
+ *   2. 发送成功应正常更新状态（回归检查，顺带测出 last_reminder_at
+ *      从未被写入的问题）
+ *   3. 模拟时间预算耗尽，验证提前中断 + timeBudgetExceeded 标记正确
+ *      （HIGH RISK 1）
+ *   4. 模拟部分处理后才耗尽预算，验证已处理部分确实被批量写入、没有
+ *      因为提前中断丢失状态（HIGH RISK 1 的关键场景）
+ *   5. 模拟单个任务处理时抛异常，验证不影响其他任务的处理和落盘
+ *   另外补了一个"连续跑两次 checkReminders"的场景，验证 last_reminder_at
+ *   修复后，第二次紧接着跑不会重复发送同一批提醒——这是直接证明
+ *   "提醒频率控制现在真的生效了"的测试，不只是证明"字段有被赋值"。
+ *   全部连同第一轮遗留的测试（8个原始场景 + TemporalEngine的39个 +
+ *   EventBus缓存的验证）一起重跑，确认没有引入回归。
+ *
+ * === 第二轮后果 ===
+ *
+ * - 2_Runtime/25_ReminderEngine.gs：checkReminders 循环重构（forEach→
+ *   for + 时间预算 + 发送结果校验 + 单任务try/catch），
+ *   _recordReminderSent 补上 last_reminder_at 赋值，SheetUtils 调用
+ *   全部改命名空间形式。
+ * - 2_Runtime/21_SheetUtils.gs：包进 IIFE，是这几个"引擎风格"文件里
+ *   最后一个完成这项改造的。
+ * - 2_Runtime/22_QueryEngine.gs：调用方式同步更新，逻辑本身未变。
+ * - MEDIUM RISK 1（新）、MEDIUM RISK 2（新）、LOW RISK 2（新）三条
+ *   均核实属实但决定不在这里修，理由分别是"当前架构下这条路径不成立"、
+ *   "需要跨项目决定，不是单项目能改的"、"当前没有对应场景，做了就是过度
+ *   设计"——不是忽略，是判断过后的决定，完整理由见上。
  */

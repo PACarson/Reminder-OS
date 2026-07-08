@@ -3,11 +3,13 @@
  * Reminder OS v1.0 — 文件地图
  *
  * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
- * 已替换为你提供的真实代码；随后修复外部审计对 25_ReminderEngine.gs /
- * 20_EventBus.gs 的 6 项发现（HIGH/MEDIUM/LOW 各两条）；评估 Reminder OS
- * V2 构想并规划分阶段 Roadmap；Phase A（Temporal Engine）完成 Contract
- * 设计（A0）+ 实现（A1），5_Testing 层第一次有内容。完整决策依据见
- * 00_ADR_001 到 00_ADR_004（见下）。
+ * 已替换为你提供的真实代码；修复第一轮外部审计对 25_ReminderEngine.gs /
+ * 20_EventBus.gs 的 6 项发现；评估 Reminder OS V2 构想并规划分阶段
+ * Roadmap；Phase A（Temporal Engine）完成 Contract 设计（A0）+ 实现
+ * （A1），5_Testing 层第一次有内容；修复第二轮外部审计对
+ * 25_ReminderEngine.gs/20_EventBus.gs/21_SheetUtils.gs 的 6 项发现，
+ * 并发现修复一个既有的更严重 bug（last_reminder_at 从未写入）。完整
+ * 决策依据见 00_ADR_001 到 00_ADR_004（见下）。
  */
 
 // ============================================================
@@ -70,16 +72,24 @@
  *   精简版：只发 REMINDER_SENT，不需要本地 ProjectionEngine
  *   （EventBus.publish() 内部的 "typeof ProjectionEngine !== 'undefined'"
  *   检查会安全跳过）。【2026-07-06 修改】_sheet_() 新增惰性缓存
- *   （LOW RISK 2），同一次执行内不再重复 openById；公开 API 和行为不变。
+ *   （第一轮 LOW RISK 2），同一次执行内不再重复 openById；公开 API 和
+ *   行为不变。第二轮审计的 MEDIUM RISK 1（并发实例下内存去重失效）
+ *   核实属实但决定不修，理由见 00_Project_State.gs「已知问题」。
  * 21_SheetUtils.gs 〔原 05_SheetUtils.gs〕— Projection（主：upsertRowByKey_/
  *   deleteRowByKey_/batchUpsertRowsByKey_）+ Decision 支撑（isOverdue_/
  *   parseDueDate_，供 ReminderEngine 用）+ 跨层通用工具（round1_/round2_/
  *   shallowCopy_/_cleanTitle_，历史上就是为了反重复实现才统一搬到这里）。
- *   横跨多个子分类但没有物理拆分，理由见 ADR-001 判断6。逐字未改——
- *   batchUpsertRowsByKey_ 这次被 ReminderEngine 复用（HIGH RISK 1），
- *   函数本身没有改动。
+ *   横跨多个子分类但没有物理拆分，理由见 ADR-001 判断6。
+ *   【2026-07-06 第二轮审计，LOW RISK 1】包进 IIFE（SheetUtils 模块），
+ *   是最后一个完成这项改造的"引擎风格"文件，对外暴露 SheetUtils.xxx
+ *   共11个函数，调用方（22_QueryEngine.gs/25_ReminderEngine.gs）同步
+ *   改成命名空间形式。函数内部逻辑本身逐字未改。第二轮 MEDIUM RISK 2
+ *   （单一共享 Spreadsheet 的容量/隔离顾虑）核实属实但决定不修，理由见
+ *   00_Project_State.gs「已知问题」。
  * 22_QueryEngine.gs 〔原 12_QueryEngine.gs〕— Query。
- *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逐字未改。
+ *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逻辑
+ *   逐字未改，【2026-07-06】调用 SheetUtils 的方式同步改成命名空间形式
+ *   （SheetUtils.getSheet_/SheetUtils.getHeaderMap_）。
  * 25_ReminderEngine.gs 〔原 92_ReminderEngine.gs〕— Decision
  *   （_shouldRemind/_isOverdue/_hoursUntilDue）+ Execution
  *   （checkReminders/_buildReminder/_sendReminder/_recordReminderSent，
@@ -88,14 +98,23 @@
  *   【2026-07-06 早些时候】_shouldRemind 修复上一轮 HIGH RISK 2：新增
  *   REMINDER_ADVANCE_HOURS 常量 + _hoursUntilDue 辅助函数，未逾期且距
  *   due_date 超过提前量时直接不提醒。里程类 due_date 不受影响。
- *   【2026-07-06 同日稍晚，外部审计新一轮 6 项发现，见 ADR-002】结构性
+ *   【2026-07-06 同日稍晚，第一轮外部审计6项发现，见 ADR-002】结构性
  *   重写：全部逻辑包进 IIFE（ReminderEngine 模块），只保留 checkReminders
  *   一个全局薄封装函数供 GAS 触发器绑定（MEDIUM RISK 2）；checkReminders
- *   循环内不再逐任务 upsertRowByKey_，改成收集后 batchUpsertRowsByKey_
- *   一次性批量写（HIGH RISK 1）；_sendReminder 之间新增
- *   Utilities.sleep(1000) 节流（HIGH RISK 2）；lock.waitLock 从 5000ms
- *   延长到 30000ms（LOW RISK 1）；_updateReminderCount 改名
- *   _recordReminderSent，职责收窄为只发事件+更新内存计数。
+ *   循环内不再逐任务 upsertRowByKey_，改成收集后批量写（HIGH RISK 1）；
+ *   _sendReminder 之间新增 Utilities.sleep(1000) 节流（HIGH RISK 2）；
+ *   lock.waitLock 从 5000ms 延长到 30000ms（LOW RISK 1）；
+ *   _updateReminderCount 改名 _recordReminderSent。
+ *   【2026-07-06 第二轮外部审计，见 ADR-002「第二轮」】checkReminders
+ *   再次重构：forEach 改 for 循环 + 时间预算机制（接近6分钟上限提前
+ *   中断但保证已处理部分落盘，HIGH RISK 1新）；_sendReminder 返回发送
+ *   结果，只有确认成功才更新状态（HIGH RISK 2新）；单任务 try/catch
+ *   加固；调用 SheetUtils 的方式改成命名空间形式（isOverdue_→
+ *   SheetUtils.isOverdue_ 等，LOW RISK 1新）。
+ *   ⚠️ 同批顺带修了一个更严重的既有 bug（不在任何审计报告里）：
+ *   _recordReminderSent 之前从未设置 task.last_reminder_at，导致
+ *   REMINDER_INTERVAL_HOURS 的分级提醒间隔从未生效，所有任务每小时都
+ *   会重发。已修复并补充回归测试验证。
  *   2026-07-03 拆分时的判断逻辑本身、发消息内容、按钮结构均未变。
  *
  * ── 3_Intelligence ────────────────────────────────────────
@@ -125,15 +144,16 @@
 /**
  * 2_Runtime/25_ReminderEngine.gs
  *   → QueryEngine.getPendingTasks()                 [2_Runtime/22_QueryEngine.gs]
- *   → isOverdue_ / parseDueDate_ / batchUpsertRowsByKey_
- *                                                     [2_Runtime/21_SheetUtils.gs]
+ *   → SheetUtils.isOverdue_ / SheetUtils.parseDueDate_ /
+ *     SheetUtils.batchUpsertRowsByKey_                [2_Runtime/21_SheetUtils.gs]
  *   → Output.sendMessage                             [4_Integration/40_Output.gs]
  *   → EventBus.publish                                [2_Runtime/20_EventBus.gs]
- *   （2026-07-06 起：批量落盘用 batchUpsertRowsByKey_，不再是逐任务
- *   upsertRowByKey_，见 ADR-002 HIGH RISK 1）
+ *   （2026-07-06 第一轮起：批量落盘不再是逐任务 upsertRowByKey_，见
+ *   ADR-002 第一轮 HIGH RISK 1；第二轮起 SheetUtils 调用改命名空间形式，
+ *   见 ADR-002 第二轮 LOW RISK 1）
  *
  * 2_Runtime/22_QueryEngine.gs
- *   → getSheet_ / getHeaderMap_                       [2_Runtime/21_SheetUtils.gs]
+ *   → SheetUtils.getSheet_ / SheetUtils.getHeaderMap_ [2_Runtime/21_SheetUtils.gs]
  *
  * 2_Runtime/20_EventBus.gs
  *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]

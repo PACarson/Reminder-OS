@@ -15,7 +15,9 @@
  * 部分。Inventory 部分（getInventory/findInventoryByName/getLowStockItems/
  * getExpiringItems）留在 Core 项目自己的副本里，本项目不需要。
  *
- * 依赖：21_SheetUtils.gs（getSheet_, getHeaderMap_）
+ * 依赖：21_SheetUtils.gs（SheetUtils.getSheet_, SheetUtils.getHeaderMap_
+ *   —— 2026-07-06 第二轮审计后 SheetUtils 包进 IIFE，调用方式从裸调用
+ *   改成命名空间形式，见 21_SheetUtils.gs 自己的文件头说明）
  */
 
 var QueryEngine = (function () {
@@ -26,11 +28,11 @@ var QueryEngine = (function () {
 
   function _readAllRows_(sheetName) {
     try {
-      var sheet = getSheet_(sheetName);
+      var sheet = SheetUtils.getSheet_(sheetName);
       var lastRow = sheet.getLastRow();
       if (lastRow < 2) return [];
 
-      var headerMap = getHeaderMap_(sheet);
+      var headerMap = SheetUtils.getHeaderMap_(sheet);
       var numCols   = sheet.getLastColumn();
       var rows      = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
 

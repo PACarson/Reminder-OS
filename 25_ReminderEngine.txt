@@ -3,36 +3,58 @@
  * Blueprint 迁入 2_Runtime/。承担 Decision（_shouldRemind/_isOverdue）+
  * Execution（checkReminders/_buildReminder/_sendReminder）两种角色，
  * 另外会触发 Runtime/Event（EventBus.publish）和 Runtime/Projection
- * （现在是 batchUpsertRowsByKey_）。这是本项目的核心域引擎，不拆成多个
- * 文件——原因见 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。]
+ * （SheetUtils.batchUpsertRowsByKey_）。这是本项目的核心域引擎，不拆成
+ * 多个文件——原因见 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。]
  *
- * 🐛 2026-07-06 外部审计修复（HIGH RISK 1/2、MEDIUM RISK 2、LOW RISK 1，
- * 核实属实后采纳，完整决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt。
- * 注意：这轮审计的 "HIGH RISK 2" 跟上一轮 HIGH RISK 2（due_date 临近性
- * 判断，已经在 2026-07-06 早些时候修过）是两件不同的事，编号撞了，别混）：
- *
+ * 🐛 2026-07-06 第一轮外部审计修复（HIGH RISK 1/2、MEDIUM RISK 2、
+ * LOW RISK 1，核实属实后采纳，完整决策依据见
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.txt）：
  * 1. HIGH RISK 1：checkReminders 循环里之前每提醒一个任务就立刻调
- *    upsertRowByKey_（O(N) 次"扫全表找行号+写一行"的 Sheet I/O）。现在
- *    循环里只更新内存、收集需要落盘的任务，循环结束后用
- *    batchUpsertRowsByKey_（21_SheetUtils.gs 已有的批量函数，不重复
- *    实现）一次性批量写回。
+ *    upsertRowByKey_（O(N) 次全表扫描式 Sheet I/O）。改成循环里只更新
+ *    内存、收集需要落盘的任务，循环结束后批量写回。
+ *    ⚠️ 这个批量写回的设计后来在第二轮审计被发现有新问题，见下方
+ *    「第二轮外部审计修复」HIGH RISK 1。
  * 2. HIGH RISK 2：_sendReminder 之间加 Utilities.sleep(1000)，避免撞
- *    Telegram 限流（2026-07-06 查了 Telegram 官方 Bots FAQ 核实：单聊天
- *    ≤1条/秒，群组 ≤20条/分钟，全局批量 ≤约30条/秒——本项目的提醒几乎
- *    都发到同一个 chat_id，单聊限流是这里真正要防的那道线，1秒节流足够）。
- * 3. MEDIUM RISK 2：全部逻辑和常量包进 IIFE（ReminderEngine 模块），不再
- *    平铺全局，跟 22_QueryEngine.gs/40_Output.gs 的写法一致，避免未来跟
- *    其他模块合并部署时静默覆盖同名全局。
- *    ⚠️ 对审计原始建议做了修正：checkReminders 不能只是 IIFE 返回对象里
- *    的一个属性——GAS 的 ScriptApp.newTrigger('checkReminders') 是按
- *    【字符串名字】找一个全局函数声明来绑定触发器，找不到
- *    ReminderEngine.checkReminders 这种写法，触发器会直接失效。所以文件
- *    最下面单独留了一个同名全局薄封装函数，只做转发，不含业务逻辑——这是
- *    触发器能正常工作的唯一必须留在全局作用域的入口，也是
- *    1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识的名字。
- * 4. LOW RISK 1：lock.waitLock 从 5000ms 延长到 30000ms——HIGH RISK 2 的
- *    节流会让单次 checkReminders 正常耗时变长，5秒等待太容易让下一小时
- *    触发器误判"前一个没跑完"而整段跳过。
+ *    Telegram 限流。
+ * 3. MEDIUM RISK 2：全部逻辑和常量包进 IIFE（ReminderEngine 模块），
+ *    只留 checkReminders 一个全局薄封装供 GAS 触发器绑定（触发器按字符串
+ *    名字找全局函数，绑定不到 IIFE 属性）。
+ * 4. LOW RISK 1：lock.waitLock 从 5000ms 延长到 30000ms。
+ *
+ * 🐛 2026-07-06 第二轮外部审计修复（HIGH RISK 1/2、LOW RISK 1 关联，
+ * 核实属实后采纳，完整决策依据见
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.txt 文末补充记录）：
+ * 1. HIGH RISK 1（新）：第一轮把 Sheet 写入挪到循环结束后一次性批量写，
+ *    解决了 O(N) I/O 问题，但引入了新风险——如果发送数量多、
+ *    Utilities.sleep 节流累积耗时长，checkReminders 有可能撞上 GAS 6
+ *    分钟执行硬上限被强制终止，此时循环外的批量写入永远不会执行，
+ *    已经发出去的 Telegram 消息的状态（reminder_count/last_reminder_at）
+ *    完全没有落盘，下一次触发器会重复提醒。
+ *    修复：加入时间预算机制（EXECUTION_TIME_BUDGET_MS），循环内每次
+ *    处理前检查已耗时，接近上限就提前中断循环——但中断之后仍然立即执行
+ *    已处理任务的批量写入，不会因为提前中断就跳过落盘。剩余未处理任务
+ *    留给下一次触发器，这是安全、正确的行为（这些任务本来就还没发送，
+ *    下次再判断一次不是 bug）。
+ * 2. HIGH RISK 2（新）：Output.sendMessage 遇到 Telegram API 报错/网络
+ *    异常时会返回 {ok:false,...} 而不是 throw，但 _sendReminder 之前
+ *    直接丢弃了这个返回值，导致哪怕消息实际发送失败（用户封锁了 Bot、
+ *    chat_id 失效、token 异常等），系统依然会照常累加 reminder_count、
+ *    误以为已经送达，造成静默丢失且不会重试。
+ *    修复：_sendReminder 改为返回 Output.sendMessage 的结果；
+ *    checkReminders 只有在 sendResult.ok 为真时才调用
+ *    _recordReminderSent、才把任务收进批量写入列表——发送失败的任务
+ *    完全不改状态，下次触发器会正常重试。
+ * 3. 顺带加固：循环内每个任务的处理包了一层 try/catch，单个任务处理
+ *    异常（比如某条脏数据导致 _buildReminder 抛错）不会拖垮整批已经
+ *    处理成功、还没来得及批量写入的任务。这不是这轮审计直接点名的问题，
+ *    是跟上面两条一起重构这段循环时顺手加固的，跟"时间预算提前中断也要
+ *    保证已处理的落盘"是同一个"部分失败不能让已成功的也陪葬"的思路。
+ *
+ * ⚠️ 关联但没有在这个文件改的项（第二轮审计还提到但不在这里）：
+ * SheetUtils 的函数调用从这轮起改成 SheetUtils.xxx 的命名空间形式（原来
+ * 是裸调用 isOverdue_/parseDueDate_/batchUpsertRowsByKey_），因为
+ * 21_SheetUtils.gs 这次也包进了 IIFE（第二轮审计 LOW RISK 1），完整
+ * 说明见 21_SheetUtils.gs 自己的文件头。
  *
  * Reminder OS v1.0（原 JARVIS CORE v2.0 — Phase 1, Module 2）
  *
@@ -45,9 +67,12 @@
  * 拆分时只有两处因为依赖的函数换了地方而不得不改，判断逻辑本身当时逐字
  * 未动。
  *
- * ✅ 2026-07-06（早些时候）：_shouldRemind 的上一轮 HIGH RISK 2（缺少
- * due_date 临近性判断）已修复，见 00_Project_State.txt「已完成」。
- * REMINDER_INTERVAL_HOURS 数值本身未变。
+ * ✅ 2026-07-06（早些时候）：_shouldRemind 的判断逻辑 HIGH RISK 2
+ * （缺少 due_date 临近性判断，注意这是【最早那一轮】审计的编号，跟上面
+ * 两轮 ReminderEngine/EventBus 审计的 HIGH RISK 1/2 是三件不同的事，
+ * 编号都撞了，务必对照日期和 ADR 编号，不要只看"HIGH RISK N"这个标签）
+ * 已修复，见 00_Project_State.txt「已完成」。REMINDER_INTERVAL_HOURS
+ * 数值本身未变。
  *
  * due_date 字段两种格式：
  *   'YYYY-MM-DD'  → 日期类，直接判断是否过期，也能算距今多久
@@ -65,30 +90,40 @@ var ReminderEngine = (function () {
     OVERDUE: 24 // R4: 逾期强制每24小时重复，不管原本优先级
   };
 
-  // 上一轮 bugfix（2026-07-06，HIGH RISK 2，见 00_Project_State.txt「已完成」）：
-  // 未逾期时，距 due_date 还剩多久（小时）才允许开始提醒，默认72小时/3天，
-  // 可调整，不影响下面的判断逻辑。
+  // 未逾期时，距 due_date 还剩多久（小时）才允许开始提醒，默认72小时/
+  // 3天，可调整，不影响下面的判断逻辑。
   var REMINDER_ADVANCE_HOURS = 72;
 
-  // 🐛 本轮 bugfix（2026-07-06，外部审计 HIGH RISK 2）：Telegram 单聊限流是
-  // 每秒最多1条消息，本项目的提醒几乎都发到同一个 chat_id，所以每发一条
-  // 就等这么久。先用固定1秒节流，不做更复杂的 per-chat/全局分别限流
-  // （P6，等真的出现多用户/多chat场景再升级）。
+  // Telegram 单聊限流是每秒最多1条消息，本项目的提醒几乎都发到同一个
+  // chat_id，所以每发一条就等这么久，用固定1秒节流，不做更复杂的
+  // per-chat/全局分别限流（P6，多用户/多chat场景真的出现了再升级——
+  // 第二轮审计 LOW RISK 2 也提到这点，评估后维持现状，见
+  // 00_Project_State.txt「已知问题」的说明）。
   var TELEGRAM_SEND_THROTTLE_MS = 1000;
 
-  // 🐛 本轮 bugfix（2026-07-06，外部审计 LOW RISK 1）：原来是5000ms。加了
-  // 上面的 Telegram 节流后单次 checkReminders 正常耗时会变长，5秒等待
-  // 太容易让下一小时触发器误判"前一个没跑完"而整段跳过提醒。延长到
-  // 30秒，仍然只占 GAS 6分钟执行上限的一小部分。
+  // lock.waitLock 的等待上限。HIGH RISK 2 的节流会让单次 checkReminders
+  // 正常耗时变长，等待太短容易让下一小时触发器误判"前一个没跑完"而
+  // 整段跳过。
   var LOCK_WAIT_MS = 30000;
 
+  // 🐛 第二轮 bugfix（2026-07-06，HIGH RISK 1）：单次 checkReminders 的
+  // 时间预算上限。GAS 单次执行硬上限是6分钟，这里留1分钟安全余量——
+  // 接近这个预算就提前中断循环，但仍然保证已处理任务的状态落盘，不会
+  // 因为跑到一半被强制终止就导致"消息发了、状态没记"的重复提醒问题。
+  var EXECUTION_TIME_BUDGET_MS = 5 * 60 * 1000;
+
   /**
-   * 🐛 bugfix（2026-07-06，外部审计 HIGH RISK 1/2，核实属实后采纳）：
-   * 之前循环体内每提醒一个任务就立刻调 upsertRowByKey_（O(N) 次全表扫描
-   * 式 Sheet I/O）+ 无间隔连续调 Telegram sendMessage（撞限流）。
-   * 现在：循环内只更新内存对象、收集需要落盘的任务，发送之间加节流；
-   * 循环结束后一次性 batchUpsertRowsByKey_ 批量写回（复用
-   * 21_SheetUtils.gs 已有的批量函数，不重复实现，避免 C5）。
+   * 🐛 第二轮 bugfix（2026-07-06，HIGH RISK 1/2，核实属实后采纳）：
+   * 1. 时间预算：循环内每次处理前检查已耗时，接近 EXECUTION_TIME_BUDGET_MS
+   *    就提前 break，但 break 之后依然执行批量写入——已处理的部分永远
+   *    会落盘，不会因为提前中断就丢失状态。剩余未处理任务留给下一次
+   *    触发器，这是安全的（它们本来就还没发送）。
+   * 2. 发送结果校验：只有 Output.sendMessage 返回 {ok:true,...} 时才
+   *    调 _recordReminderSent、才把任务加进批量写入列表。发送失败
+   *    （网络异常/Telegram API 拒绝/token或chat_id无效）的任务完全不
+   *    改状态，下次触发器会正常重新判断、重新尝试。
+   * 3. 单任务 try/catch：某一条任务处理时抛异常，不影响其他任务的处理
+   *    和已处理任务的批量落盘。
    */
   function checkReminders() {
     var lock = LockService.getScriptLock();
@@ -99,29 +134,58 @@ var ReminderEngine = (function () {
       return { checked: 0, sent: 0 };
     }
 
+    var startedAt = Date.now();
     try {
       var tasks = QueryEngine.getPendingTasks();
       var sentCount = 0;
-      var updatedTasks = []; // HIGH RISK 1: 收集需要批量落盘的任务，不逐个写
+      var failedCount = 0;
+      var updatedTasks = [];
+      var timeBudgetExceeded = false;
+      var processedCount = 0;
 
-      tasks.forEach(function (task) {
-        if (_shouldRemind(task)) {
-          var message = _buildReminder(task);
-          _sendReminder(task, message);
-          _recordReminderSent(task); // 只发事件+改内存，不再直接写Sheet
-          updatedTasks.push(task);
-          sentCount++;
-
-          // HIGH RISK 2: 节流，避免连续调用撞 Telegram 单聊限流
-          Utilities.sleep(TELEGRAM_SEND_THROTTLE_MS);
+      for (var i = 0; i < tasks.length; i++) {
+        if (Date.now() - startedAt > EXECUTION_TIME_BUDGET_MS) {
+          timeBudgetExceeded = true;
+          Logger.log('[ReminderEngine] 时间预算耗尽（' + processedCount + '/' + tasks.length +
+            ' 已处理），提前中断循环，剩余任务留给下一次触发器');
+          break;
         }
-      });
+        processedCount++;
 
-      if (updatedTasks.length > 0) {
-        batchUpsertRowsByKey_('Tasks', 'task_id', updatedTasks);
+        var task = tasks[i];
+        try {
+          if (_shouldRemind(task)) {
+            var message = _buildReminder(task);
+            var sendResult = _sendReminder(task, message);
+
+            if (sendResult && sendResult.ok) {
+              _recordReminderSent(task);
+              updatedTasks.push(task);
+              sentCount++;
+            } else {
+              failedCount++;
+              Logger.log('[ReminderEngine] 发送失败，不更新状态，留待下次重试: task_id=' +
+                task.task_id + ' error=' + (sendResult && sendResult.error));
+            }
+
+            Utilities.sleep(TELEGRAM_SEND_THROTTLE_MS); // 不管发送成功与否都要节流
+          }
+        } catch (taskErr) {
+          Logger.log('[ReminderEngine] 处理单个任务时出错，跳过这一条，不影响其他任务: task_id=' +
+            task.task_id + ' error=' + taskErr.message);
+        }
       }
 
-      return { checked: tasks.length, sent: sentCount };
+      if (updatedTasks.length > 0) {
+        SheetUtils.batchUpsertRowsByKey_('Tasks', 'task_id', updatedTasks);
+      }
+
+      return {
+        checked: tasks.length,
+        sent: sentCount,
+        failed: failedCount,
+        timeBudgetExceeded: timeBudgetExceeded
+      };
     } finally {
       lock.releaseLock();
     }
@@ -130,19 +194,20 @@ var ReminderEngine = (function () {
   /**
    * 判断 due_date 是否已经过期。
    * 本次修改（2026-06-27，外部审计MEDIUM RISK 7，核实属实后采纳）：
-   * 实际逻辑搬到了 21_SheetUtils.gs 的 isOverdue_()/parseDueDate_()，
-   * 这里只剩一层委托，不再维护两份相同判断逻辑。
+   * 实际逻辑在 21_SheetUtils.gs 的 isOverdue_()/parseDueDate_()，这里
+   * 只剩一层委托。2026-07-06 第二轮审计后 SheetUtils 包进了 IIFE，调用
+   * 方式改成 SheetUtils.isOverdue_(...)。
    */
   function _isOverdue(task) {
-    return isOverdue_(task.due_date);
+    return SheetUtils.isOverdue_(task.due_date);
   }
 
   function _shouldRemind(task) {
     var overdue = _isOverdue(task);
 
-    // 上一轮 bugfix（2026-07-06，HIGH RISK 2）：未逾期 且 距 due_date 还
-    // 早于 REMINDER_ADVANCE_HOURS 时，直接不提醒。里程类/无法解析的
-    // due_date（_hoursUntilDue 返回 null）维持原行为不受影响。
+    // 未逾期 且 距 due_date 还早于 REMINDER_ADVANCE_HOURS 时，直接不
+    // 提醒。里程类/无法解析的 due_date（_hoursUntilDue 返回 null）维持
+    // 原行为不受影响。
     if (!overdue) {
       var hoursUntilDue = _hoursUntilDue(task);
       if (hoursUntilDue !== null && hoursUntilDue > REMINDER_ADVANCE_HOURS) {
@@ -164,13 +229,13 @@ var ReminderEngine = (function () {
   /**
    * 距 due_date 还有多少小时（未来为正数，已过期为负数）。
    * 里程类（'40000km'）或无法解析的 due_date 返回 null。
-   * 复用 21_SheetUtils.gs 的 parseDueDate_，不重复实现（避免 C5）。
+   * 复用 SheetUtils.parseDueDate_，不重复实现（避免 C5）。
    */
   function _hoursUntilDue(task) {
     if (!task.due_date) return null;
     var raw = String(task.due_date).trim();
     if (/km$/i.test(raw)) return null;
-    var due = parseDueDate_(raw);
+    var due = SheetUtils.parseDueDate_(raw);
     if (!due || isNaN(due.getTime())) return null;
     return (due.getTime() - Date.now()) / 3600000;
   }
@@ -197,15 +262,14 @@ var ReminderEngine = (function () {
   }
 
   /**
-   * ⚠️ 2026-07-06 外部审计 MEDIUM RISK 1 关联说明（这个函数本身没有改
-   * 代码，改的是文档+诊断，见 00_Project_Constitution.gs 新增的 P6 契约
-   * 条款和 1_Foundation/11_Setup.gs 的 webhook 可达性检查）：
-   * 下面这两个 inline button 的 callback_data（task_done:/task_snooze:）
-   * 依赖【另一个项目】（Personal AI Core）注册了 Telegram webhook、并且
-   * 用同一个 Bot Token 实现了对这两种 callback_data 的解析——本项目自己
-   * "不接 webhook"，点按钮之后的实际处理完全不在这个文件、甚至不在这个
-   * GAS 项目里。这是当前架构下必须接受的跨项目耦合，没法在这个函数里
-   * 单独"修掉"，只能靠文档约束 + 诊断可达性检查来降低"两边失联"的风险。
+   * ⚠️ MEDIUM RISK 1（最早那一轮审计）关联说明：下面这两个 inline
+   * button 的 callback_data（task_done:/task_snooze:）依赖【另一个
+   * 项目】（Personal AI Core）注册了 Telegram webhook 并解析——本项目
+   * 自己不接 webhook，完整契约见 00_Project_Constitution.gs P6。
+   *
+   * 🐛 第二轮 bugfix（2026-07-06，HIGH RISK 2）：现在返回
+   * Output.sendMessage 的结果，不再丢弃——调用方（checkReminders）需要
+   * 这个返回值判断发送是否真的成功，才能决定要不要更新提醒状态。
    */
   function _sendReminder(task, message) {
     var keyboard = {
@@ -214,27 +278,31 @@ var ReminderEngine = (function () {
         { text: '⏰ Snooze 1h', callback_data: 'task_snooze:' + task.task_id }
       ]]
     };
-    Output.sendMessage(task.chat_id, message, keyboard);
+    return Output.sendMessage(task.chat_id, message, keyboard);
   }
 
   /**
-   * 🐛 bugfix（2026-07-06，外部审计 HIGH RISK 1，核实属实后采纳）：
-   * 原名 _updateReminderCount。之前这里直接调
-   * upsertRowByKey_('Tasks','task_id',task.task_id,task)，每提醒一个
-   * 任务就单独触发一次"扫全表找行号+写一行"的 Sheet I/O。
-   * 现在改名 _recordReminderSent，只做两件事：发布 REMINDER_SENT 事件、
-   * 更新内存里的 task.reminder_count——不再直接写 Sheet。实际的批量写入
-   * 挪到 checkReminders() 循环结束后统一处理，见那边的
-   * batchUpsertRowsByKey_ 调用。
+   * 只负责发布 REMINDER_SENT 事件 + 更新内存里的 task.reminder_count/
+   * last_reminder_at，不直接写 Sheet——实际的批量写入在 checkReminders()
+   * 循环结束后统一处理（见那边的 SheetUtils.batchUpsertRowsByKey_ 调用），
+   * 且只有发送真正成功时才会调用这个函数（第二轮 HIGH RISK 2 修复）。
    *
-   * ⚠️ 2026-07-03 拆分说明（历史记录，写入时机已经变了，但这段仍然解释
-   * 了"这个操作在概念上对应 Core 项目原本的 _materializeTaskRow_"）：
-   * 原来这里调的是 _materializeTaskRow_（定义在 20_ProductivityModule.gs，
-   * 那个文件现在在 Productivity OS 项目，不在这个项目里）。
-   * _materializeTaskRow_ 在这个场景下其实只做了一件事——
-   * upsertRowByKey_(TASKS_SHEET_NAME,'task_id',taskId,task)（task对象
-   * 已经是完整的），效果等同于现在 checkReminders() 循环结束后那次
-   * batchUpsertRowsByKey_ 里对应这一条任务的部分。
+   * 🐛 bugfix（2026-07-06，自己测试时发现，不在任何一轮外部审计报告里）：
+   * 这个函数（原名_updateReminderCount）从最早的版本开始就只更新了
+   * reminder_count，从来没有设置过 task.last_reminder_at！而
+   * _shouldRemind 判断"距上次提醒是否超过间隔小时数"完全依赖这个字段——
+   * 字段永远是空的，意味着 _shouldRemind 里 "if (!task.last_reminder_at)
+   * return true" 这一行永远成立，REMINDER_INTERVAL_HOURS 那套按优先级
+   * 分级的间隔（4/6/12/24小时）实际上从来没生效过，包括 OVERDUE 的
+   * "强制每24小时"（R4）也一样——所有任务只要满足提醒条件，每小时触发器
+   * 跑一次就会重发一次，不看上次到底是什么时候提醒的。
+   * 影响范围：从最早的 92_ReminderEngine.gs 到现在，历经好几轮审计
+   * （包括我自己第一轮的 mock 测试）都没抓到，因为之前的测试都是直接在
+   * 测试用的 task 对象上手动设 last_reminder_at 来验证 _shouldRemind 的
+   * 判断逻辑本身没问题（这部分测试结论仍然成立），但没有端到端验证过
+   * "发送成功之后，这个字段真的会被写回 Sheet"这一步——这次为了验证
+   * HIGH RISK 2（发送结果校验）新增的回归测试，顺带测出了这个更大的
+   * 问题。现在补上赋值。
    */
   function _recordReminderSent(task) {
     EventBus.publish(
@@ -244,8 +312,7 @@ var ReminderEngine = (function () {
       'ReminderEngine'
     );
     task.reminder_count = (task.reminder_count || 0) + 1;
-    // 注意：这里不再调 upsertRowByKey_，Sheet 写入由 checkReminders()
-    // 循环结束后的 batchUpsertRowsByKey_ 统一处理。
+    task.last_reminder_at = new Date().toISOString();
   }
 
   return {
@@ -254,14 +321,11 @@ var ReminderEngine = (function () {
 })();
 
 /**
- * 🐛 bugfix（2026-07-06，外部审计 MEDIUM RISK 2，核实属实后采纳，但对
- * 审计原始建议做了修正——见文件头注释第3点）：
  * GAS 的时间触发器（ScriptApp.newTrigger('checkReminders')）是按字符串
  * 名字在全局作用域找一个函数声明来绑定，不能绑定到
- * ReminderEngine.checkReminders 这种 IIFE 返回对象的属性，否则触发器会
- * 直接失效。这个薄封装是唯一必须留在全局作用域的入口，纯转发，不含任何
- * 业务逻辑，也是 1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识
- * 的名字，不能改名。
+ * ReminderEngine.checkReminders 这种 IIFE 返回对象的属性。这个薄封装是
+ * 唯一必须留在全局作用域的入口，纯转发，不含任何业务逻辑，也是
+ * 1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识的名字，不能改名。
  */
 function checkReminders() {
   return ReminderEngine.checkReminders();
