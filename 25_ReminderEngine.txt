@@ -56,6 +56,25 @@
  * 21_SheetUtils.gs 这次也包进了 IIFE（第二轮审计 LOW RISK 1），完整
  * 说明见 21_SheetUtils.gs 自己的文件头。
  *
+ * 🐛 2026-07-06 第三轮外部审计修复（HIGH RISK 1新、MEDIUM RISK 3，核实
+ * 属实后采纳，完整决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.gs
+ * 文末补充记录）：
+ * 1. HIGH RISK 1（新）：第二轮把批量写延后到循环结束才做一次，但如果
+ *    这一次 batchUpsertRowsByKey_ 本身失败（网络异常/Sheets服务暂时
+ *    不可用/配额超限），这一整次执行期间已经发出去的全部提醒都不会
+ *    落盘，下次触发器会整批重发。改成分批写（每凑够20个就写一次，见
+ *    _persistBatch/BATCH_WRITE_CHUNK_SIZE），把单点写入失败的影响范围
+ *    从"整次执行"缩小到"最多这一批"；每批失败会重试一次，重试仍失败
+ *    则记录清楚哪些 task_id 受影响，不让异常继续往上抛、拖累后续任务。
+ * 2. MEDIUM RISK 3：lock.waitLock(30000) 拿不到锁时，之前是直接放弃、
+ *    干等下一个整点触发器，最坏情况会让本该发送的提醒晚整整一小时。
+ *    改成安排一次性的5分钟后延迟重试（_scheduleRetryOnce），用 Script
+ *    Property 防止同一时间段内重复排队多个重试。只重试一次，不做无限
+ *    链式重试。
+ * ⚠️ 这轮审计另外两条（MEDIUM RISK: 11_Setup.gs 的 JSON.parse 未捕获；
+ * LOW RISK: 40_Output.gs 缺 UrlFetchApp 超时参数）核实后发现跟实际代码
+ * 不符，没有改动，理由见 00_Project_State.gs「已知问题」。
+ *
  * Reminder OS v1.0（原 JARVIS CORE v2.0 — Phase 1, Module 2）
  *
  * 全部任务的统一提醒系统。不允许存在第二套提醒逻辑。
@@ -112,6 +131,66 @@ var ReminderEngine = (function () {
   // 因为跑到一半被强制终止就导致"消息发了、状态没记"的重复提醒问题。
   var EXECUTION_TIME_BUDGET_MS = 5 * 60 * 1000;
 
+  // 🐛 第三轮 bugfix（2026-07-06，MEDIUM RISK 3）：拿不到锁时，不再干等
+  // 下一个整点触发器（最坏情况会晚整整一小时），改成安排一次性的延迟
+  // 重试。用 Script Property 当"是否已经排了一次重试"的标记，避免前一个
+  // 实例持续跑很久时，好几个后续触发器都各自挂一个重试 trigger、叠加
+  // 出一堆重复重试。只重试一次，不做无限链式重试——重试也失败的话，就
+  // 老老实实等下一个整点触发器，不再继续加码。
+  var RETRY_FLAG_KEY = 'REMINDER_ENGINE_RETRY_PENDING';
+  var RETRY_DELAY_MINUTES = 5;
+
+  // 🐛 第三轮 bugfix（2026-07-06，HIGH RISK 1新）：批量写不再等循环整个
+  // 结束才做一次——那样如果最后这一次 batchUpsertRowsByKey_ 本身失败
+  // （网络异常/Sheets服务暂时不可用/配额超限/锁死），会导致这一整次
+  // 执行期间已经发出去的全部提醒都没有落盘状态，下次触发器整批重发。
+  // 改成每凑够 BATCH_WRITE_CHUNK_SIZE 个就写一次，把"单点写入失败"的
+  // 影响范围从"整次执行"缩小到"最多这一批"。
+  var BATCH_WRITE_CHUNK_SIZE = 20;
+
+  /**
+   * 🐛 第三轮 bugfix（2026-07-06，HIGH RISK 1新，核实属实后采纳）：把
+   * 批量写封装成独立函数，失败时重试一次，重试仍失败就记录清楚哪些
+   * task_id 的状态没能落盘（发出去的提醒可能会在下次触发器重发），但
+   * 不把异常继续往上抛——一批写失败不应该拖累循环里后续还没处理的任务，
+   * 也不应该让整个 checkReminders 直接崩掉。
+   */
+  function _persistBatch(tasksToWrite) {
+    if (!tasksToWrite || tasksToWrite.length === 0) return;
+    try {
+      SheetUtils.batchUpsertRowsByKey_('Tasks', 'task_id', tasksToWrite);
+    } catch (e) {
+      Logger.log('[ReminderEngine] 批量写入失败，5秒后重试一次: ' + e.message);
+      try {
+        Utilities.sleep(5000);
+        SheetUtils.batchUpsertRowsByKey_('Tasks', 'task_id', tasksToWrite);
+      } catch (e2) {
+        Logger.log('[ReminderEngine] ❌ 批量写入重试后仍然失败，以下 task_id 的提醒已发出但' +
+          '状态未落盘，下次触发器可能重复提醒: ' +
+          tasksToWrite.map(function (t) { return t.task_id; }).join(',') + ' — ' + e2.message);
+      }
+    }
+  }
+
+  /**
+   * 🐛 第三轮 bugfix（2026-07-06，MEDIUM RISK 3，核实属实后采纳）：拿不到
+   * 锁时安排一次性延迟重试，而不是干等下一个整点。用 Script Property
+   * 防止重复排队——如果已经有一个重试在等待中，就不再新增。
+   */
+  function _scheduleRetryOnce() {
+    var props = PropertiesService.getScriptProperties();
+    if (props.getProperty(RETRY_FLAG_KEY)) {
+      Logger.log('[ReminderEngine] 已经有一次重试在排队，不重复安排');
+      return;
+    }
+    props.setProperty(RETRY_FLAG_KEY, String(Date.now()));
+    ScriptApp.newTrigger('checkReminders')
+      .timeBased()
+      .after(RETRY_DELAY_MINUTES * 60 * 1000)
+      .create();
+    Logger.log('[ReminderEngine] 已安排 ' + RETRY_DELAY_MINUTES + ' 分钟后重试一次');
+  }
+
   /**
    * 🐛 第二轮 bugfix（2026-07-06，HIGH RISK 1/2，核实属实后采纳）：
    * 1. 时间预算：循环内每次处理前检查已耗时，接近 EXECUTION_TIME_BUDGET_MS
@@ -124,6 +203,16 @@ var ReminderEngine = (function () {
    *    改状态，下次触发器会正常重新判断、重新尝试。
    * 3. 单任务 try/catch：某一条任务处理时抛异常，不影响其他任务的处理
    *    和已处理任务的批量落盘。
+   *
+   * 🐛 第三轮 bugfix（2026-07-06，HIGH RISK 1新/MEDIUM RISK 3，核实属实
+   * 后采纳）：
+   * 4. 拿不到锁时安排一次性延迟重试（_scheduleRetryOnce），不再干等
+   *    下一个整点触发器；成功拿到锁后清掉重试标记（不管这次执行是不是
+   *    重试触发的，只要正常跑起来了，就没有必要再保留"还有一次重试等着"
+   *    这个状态）。
+   * 5. 批量写改成分批（BATCH_WRITE_CHUNK_SIZE=20），不再等循环整个结束
+   *    才写一次——把"最后一次写入失败"的影响范围从"整次执行的全部任务"
+   *    缩小到"最多这一批"。
    */
   function checkReminders() {
     var lock = LockService.getScriptLock();
@@ -131,15 +220,18 @@ var ReminderEngine = (function () {
       lock.waitLock(LOCK_WAIT_MS);
     } catch (e) {
       Logger.log('[ReminderEngine] 前序 checkReminders 实例尚未执行完毕，跳过本次执行');
+      _scheduleRetryOnce();
       return { checked: 0, sent: 0 };
     }
+
+    PropertiesService.getScriptProperties().deleteProperty(RETRY_FLAG_KEY);
 
     var startedAt = Date.now();
     try {
       var tasks = QueryEngine.getPendingTasks();
       var sentCount = 0;
       var failedCount = 0;
-      var updatedTasks = [];
+      var pendingWrite = []; // 累积到 BATCH_WRITE_CHUNK_SIZE 就写一批，不是等到最后
       var timeBudgetExceeded = false;
       var processedCount = 0;
 
@@ -160,7 +252,7 @@ var ReminderEngine = (function () {
 
             if (sendResult && sendResult.ok) {
               _recordReminderSent(task);
-              updatedTasks.push(task);
+              pendingWrite.push(task);
               sentCount++;
             } else {
               failedCount++;
@@ -174,11 +266,14 @@ var ReminderEngine = (function () {
           Logger.log('[ReminderEngine] 处理单个任务时出错，跳过这一条，不影响其他任务: task_id=' +
             task.task_id + ' error=' + taskErr.message);
         }
+
+        if (pendingWrite.length >= BATCH_WRITE_CHUNK_SIZE) {
+          _persistBatch(pendingWrite);
+          pendingWrite = [];
+        }
       }
 
-      if (updatedTasks.length > 0) {
-        SheetUtils.batchUpsertRowsByKey_('Tasks', 'task_id', updatedTasks);
-      }
+      _persistBatch(pendingWrite); // 写掉最后不满一批的剩余部分（循环正常结束或时间预算提前退出都会走到这里）
 
       return {
         checked: tasks.length,

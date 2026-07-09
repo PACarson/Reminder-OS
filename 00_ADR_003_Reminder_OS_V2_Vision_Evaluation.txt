@@ -118,6 +118,28 @@
  *   现在不写具体接口——要等 Phase A 真的跑起来，看 Temporal Engine 暴露
  *   出来的接口用起来顺不顺手，再设计 Scheduler 怎么接它更合适。
  *
+ *   Open Questions（2026-07-06 记录，Carson 原文，刻意保留英文措辞）：
+ *
+ *   These questions are intentionally
+ *   left unanswered until Phase A
+ *   has been implemented and validated.
+ *
+ *   - Where should Reminder Rules be stored?
+ *   - How should Scheduler integrate
+ *     with existing checkReminders()?
+ *   - How should missed occurrences
+ *     be recovered?
+ *
+ *   These questions SHALL be answered
+ *   using implementation experience,
+ *   not speculation.
+ *
+ *   ⚠️ 下次要写 Phase B 设计（预期是 00_ADR_005）之前，先回来重新过一遍
+ *   这三个问题——不是重新讨论"要不要回答"，是拿着 Phase A 实际用下来的
+ *   经验（Temporal Engine 的接口用起来顺不顺手、有没有被迫改过 Contract、
+ *   哪些假设被证明是错的）去回答，而不是现在凭空猜。这是 Progression
+ *   Rule 的具体应用，不是另一条独立规则。
+ *
  * Phase C — Snooze（草案级别）
  *   目的：10分钟/30分钟/明天早上/自定义时间 的延后提醒，不破坏原本排程。
  *   粗略方向：snoozeReminder(reminderId, until) 这类形状大概率不会错太
