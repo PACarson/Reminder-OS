@@ -24,6 +24,12 @@
  * 00_Project_State.gs「已知问题」。catch 分支加了 ambiguousDelivery
  * 标记，方便以后翻日志时把这种"响应丢失导致的疑似重复"和其他真实发送
  * 失败区分开，见下方 sendMessage 的注释。
+ *
+ * 🆕 2026-07-14：新增 send(channel, target, message, options) 和
+ * CHANNEL_ADAPTERS，供 26_ReminderOffsetEngine.gs 使用（Time-Based
+ * Offset Reminder Engine 设计 §10 的 Channel Adapter Contract）。
+ * sendMessage 本身一个字节没改，25_ReminderEngine.gs（V1）继续直接调
+ * 它，不受影响。
  */
 
 var Output = (function () {
@@ -89,5 +95,56 @@ var Output = (function () {
     }
   }
 
-  return { sendMessage: sendMessage };
+  /**
+   * 🆕 2026-07-14（Time-Based Offset Reminder Engine 设计 §10）：
+   * Channel Adapter Contract —— { name, send(target, message, options) →
+   * {ok,...} }。这是design proposal里明确要求的"抽象但不过度设计"：
+   * 只加一层薄的按名字查表分发，不是插件注册/动态加载系统。
+   *
+   * telegram 适配器直接包一层 sendMessage，逻辑完全不变（options.keyboard
+   * 对应原来的 keyboard 参数）——26_ReminderOffsetEngine.gs 之后都通过
+   * Output.send('telegram', chatId, text, {keyboard:...}) 调用，不直接调
+   * sendMessage；25_ReminderEngine.gs（V1）保持不变，继续直接调
+   * sendMessage，不强迫它迁移到新接口。
+   *
+   * email/push/webhook 目前不实现——只是 CHANNEL_ADAPTERS 数量为1的事实
+   * 说明"确实只有一个"，不是遗漏。ADR-003 Phase E 的理由依然适用：
+   * 没有第二个真实实现之前，多做的任何东西都是死代码。
+   */
+  var CHANNEL_ADAPTERS = {
+    telegram: {
+      name: 'telegram',
+      send: function (target, message, options) {
+        var keyboard = options && options.keyboard;
+        return sendMessage(target, message, keyboard);
+      }
+    }
+  };
+
+  /**
+   * @param {string} channel  必须是 CHANNEL_ADAPTERS 里已注册的名字
+   * @param {string} target   该渠道下的收件地址（Telegram 是 chatId）
+   * @param {string} message
+   * @param {object} options  可选，各渠道自己解释，Telegram 目前只用
+   *                  options.keyboard
+   * @returns {{ok:boolean, ...}} 未注册的 channel 返回
+   *          {ok:false, error:'unknown_channel'}，不 throw——这是"外部
+   *          系统调用可能失败但输入合法"那一类，配置错误应该能被业务层
+   *          观察到（occurrence 会停在 pending/failed，不会静默丢失），
+   *          不应该让 26_ReminderOffsetEngine.gs 的整个批次因为一个
+   *          typo 的 channel 名字而中断。
+   */
+  function send(channel, target, message, options) {
+    var adapter = CHANNEL_ADAPTERS[channel];
+    if (!adapter) {
+      Logger.log('[Output] ❌ 未注册的 channel: ' + channel);
+      return { ok: false, error: 'unknown_channel' };
+    }
+    return adapter.send(target, message, options || {});
+  }
+
+  return {
+    sendMessage: sendMessage,
+    send: send
+  };
 })();
