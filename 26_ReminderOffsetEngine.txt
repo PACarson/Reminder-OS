@@ -43,6 +43,15 @@
  *    正在处理中/等重试的 in-flight 记录"），但这张表本身有界（非终态才
  *    留在这里），查它没有 History 那个问题。
  *
+ *    🐛 2026-07-15 修订（外部审计 HIGH RISK 1，核实属实后采纳）：上面
+ *    "{channel: 上一次为这个 channel 解决掉的 fire_at}"这句已过时。
+ *    实际存的语义改成"{channel: 上一次解决掉这个 channel 时，
+ *    effectiveDue 是多少}"——原方案直接比较 fire_at 大小，隐含"到期时间
+ *    只会不变或后移"的假设，任务到期时间被改早时会被新算出的、更小的
+ *    fire_at 误判成"已经处理过"而跳过。字段名（resolved_fire_ats）保留
+ *    不变，只改存的值和比较方式，完整理由见 checkOffsetReminders 里
+ *    对应改动点的注释。
+ *
  * 依赖假设（design doc §2 Open Item 1，尚未拿到 Productivity OS 代码
  * 验证）：_resolveEffectiveDueDatetime_ 把"读哪个到期字段"收在一个函数
  * 里，due_datetime/due_date+due_time/纯 due_date 三种可能都试一遍，
@@ -248,13 +257,18 @@ var ReminderOffsetEngine = (function () {
       }
     }
     if (occurrenceDeleteKeys && occurrenceDeleteKeys.length > 0) {
-      occurrenceDeleteKeys.forEach(function (key) {
-        try {
-          SheetUtils.deleteRowByKey_(OCCURRENCES_SHEET, 'idempotency_key', key);
-        } catch (e) {
-          Logger.log('[ReminderOffsetEngine] ⚠️ 从 Occurrences 删除 ' + key + ' 失败: ' + e.message);
-        }
-      });
+      // 🐛 bugfix（顺带修复，2026-07-15）：审计 MEDIUM RISK 1 明确点名的是
+      // 下面 ruleDeleteIds 那段，但这里 occurrenceDeleteKeys 是完全相同
+      // 的"逐个 key 调 deleteRowByKey_"形状——而且触发频率比规则删除更高
+      // （每条 occurrence 无论 sent/failed-归档/cancelled 都会走到这里），
+      // 是同一类问题里实际影响更大的那一半，一起换成
+      // batchDeleteRowsByKey_，不留一个显而易见会被下一次审计重新点名
+      // 的姊妹问题。
+      try {
+        SheetUtils.batchDeleteRowsByKey_(OCCURRENCES_SHEET, 'idempotency_key', occurrenceDeleteKeys);
+      } catch (e) {
+        Logger.log('[ReminderOffsetEngine] ⚠️ 批量删除 Occurrences 记录失败: ' + e.message);
+      }
     }
     if (occurrenceUpserts && occurrenceUpserts.length > 0) {
       try {
@@ -271,13 +285,15 @@ var ReminderOffsetEngine = (function () {
       }
     }
     if (ruleDeleteIds && ruleDeleteIds.length > 0) {
-      ruleDeleteIds.forEach(function (id) {
-        try {
-          SheetUtils.deleteRowByKey_(RULES_SHEET, 'rule_id', id);
-        } catch (e) {
-          Logger.log('[ReminderOffsetEngine] ⚠️ 退休规则 ' + id + ' 删除失败: ' + e.message);
-        }
-      });
+      // 🐛 bugfix（外部审计 MEDIUM RISK 1，2026-07-15，核实属实后采纳）：
+      // 原来逐个 rule_id 调 deleteRowByKey_，每次都各自完整开表+扫 key
+      // 列；改成一次 batchDeleteRowsByKey_，只定位一次、按行号降序批量
+      // 删除，完整理由见 21_SheetUtils.gs 里那个函数自己的说明。
+      try {
+        SheetUtils.batchDeleteRowsByKey_(RULES_SHEET, 'rule_id', ruleDeleteIds);
+      } catch (e) {
+        Logger.log('[ReminderOffsetEngine] ⚠️ 批量删除退休规则失败: ' + e.message);
+      }
     }
   }
 
@@ -349,6 +365,29 @@ var ReminderOffsetEngine = (function () {
   function checkOffsetReminders() {
     _cleanupStaleRetryTrigger_();
 
+    // ⚠️ 范围说明（外部审计 HIGH RISK 4，2026-07-15 核实属实，评估后未在
+    // 代码层面"修复"，理由如下）：下面这把锁是 LockService.getScriptLock()，
+    // 只能防止本项目自己的 checkOffsetReminders 并发执行两次，不能阻止
+    // Personal AI Core（处理 Telegram 按钮回调）或 Productivity OS 在
+    // 本次执行期间并发写共享的 Tasks/ReminderRules 等表——GAS 的
+    // LockService 不跨 standalone 项目生效，这是平台限制，不是这里能
+    // 修的代码 bug。审计给的两条修复方向都评估过：①
+    // 在共享 Spreadsheet 里建一张专属锁定表，各项目写入前互相协调——但
+    // 这需要 Personal AI Core 和 Productivity OS 也同步实现并遵守同一套
+    // 协议，本项目单方面加锁对那两个项目的写入没有任何约束力，等于只加
+    // 复杂度不加保护，是虚假的安全感；② 把三个项目都迁移成绑定在同一
+    // Spreadsheet 下的容器绑定脚本以启用 LockService.getDocumentLock()——
+    // 这是牵动全平台三个项目的部署架构变动，不是能在 Reminder OS 这一个
+    // 项目里单方面决定的事，也看不到另外两个项目的代码去确认可行性。
+    // 跟 21_SheetUtils.gs batchUpdateFieldsByKey_ 文件头、
+    // 00_ADR_002_ReminderEngine_Audit_Fixes.txt「MEDIUM RISK 1」处理
+    // Tasks 表同一类跨项目并发风险时的判断一致：现有的按需定点单元格
+    // 写入（batchUpdateFieldsByKey_/batchReadFieldsByKey_ 只碰实际要改
+    // 的字段，不整行/整表覆写）已经是在没有跨项目锁的前提下能做到的
+    // 合理缓解；真正的解决需要一次跨三个项目的协调决定，建议记录进
+    // 00_Project_State.gs「已知问题」，不在这里假装修好。25_ReminderEngine.gs
+    // 的 checkReminders 是同一个平台限制，同一个结论，见那边对应位置的
+    // 注释。
     var lock = LockService.getScriptLock();
     try {
       lock.waitLock(LOCK_WAIT_MS);
@@ -366,15 +405,47 @@ var ReminderOffsetEngine = (function () {
     try {
       var allRules = _readAllRows_(RULES_SHEET);
       var activeRules = [];
-      var staleRuleIds = [];
       var taskIdsWithRules = {};
+
+      // 🐛 bugfix（外部审计 MEDIUM RISK 1，2026-07-15，核实属实后采纳）：
+      // ruleDeletes（原 staleRuleIds）挪到这里，跟其余五个批量累加数组、
+      // flush/flushIfNeeded 一起最先声明——原来 staleRuleIds 独立于这套
+      // 批量机制之外收集，循环期间不受 flushIfNeeded 影响，函数末尾才用
+      // 一次同步 forEach 循环逐个 SheetUtils.deleteRowByKey_，每次调用
+      // 各自完整地开表+读表头+扫 key 列，一旦本轮累积的失效规则较多，会
+      // 在函数收尾阶段集中拖慢执行、逼近超时。现在 ruleDeletes 和
+      // occUpserts/historyInserts/occDeletes/ruleUpdates 用同一套节奏
+      // 分批 flush（见下方 flushIfNeeded），不再有"循环内不批、循环外
+      // 一次性处理"的不一致；实际的物理删除也从"每个 key 各一次
+      // deleteRowByKey_"改成 SheetUtils.batchDeleteRowsByKey_ 一次性
+      // 定位+批量删除，见 _persistBatch_ 和 21_SheetUtils.gs 里那个函数
+      // 自己的说明。
+      var occUpserts = [];
+      var historyInserts = [];
+      var occDeletes = [];
+      var pendingEvents = [];
+      var ruleUpdates = [];
+      var ruleDeletes = [];
+
+      function flush() {
+        _persistBatch_(occUpserts, historyInserts, occDeletes, ruleUpdates, ruleDeletes);
+        _publishPendingEvents_(pendingEvents);
+        occUpserts = []; historyInserts = []; occDeletes = []; ruleUpdates = []; pendingEvents = []; ruleDeletes = [];
+      }
+      function flushIfNeeded() {
+        if (occUpserts.length + historyInserts.length + occDeletes.length + ruleUpdates.length + ruleDeletes.length >= BATCH_WRITE_CHUNK_SIZE) {
+          flush();
+        }
+      }
+
       for (var r = 0; r < allRules.length; r++) {
         var ruleRow = allRules[r];
         taskIdsWithRules[ruleRow.task_id] = true;
         if (ruleRow.rule_status === 'active') {
           activeRules.push(ruleRow);
         } else {
-          staleRuleIds.push(ruleRow.rule_id); // 人工改过状态但还没被删掉的行，一并清理
+          ruleDeletes.push(ruleRow.rule_id); // 人工改过状态但还没被删掉的行，一并清理
+          flushIfNeeded();
         }
       }
 
@@ -392,23 +463,6 @@ var ReminderOffsetEngine = (function () {
       // Occurrences 有界，整表读没问题（跟上面 Rules 同理）
       var occurrenceByKey = {};
       _readAllRows_(OCCURRENCES_SHEET).forEach(function (o) { occurrenceByKey[o.idempotency_key] = o; });
-
-      var occUpserts = [];
-      var historyInserts = [];
-      var occDeletes = [];
-      var pendingEvents = [];
-      var ruleUpdates = [];
-
-      function flush() {
-        _persistBatch_(occUpserts, historyInserts, occDeletes, ruleUpdates, []);
-        _publishPendingEvents_(pendingEvents);
-        occUpserts = []; historyInserts = []; occDeletes = []; ruleUpdates = []; pendingEvents = [];
-      }
-      function flushIfNeeded() {
-        if (occUpserts.length + historyInserts.length + occDeletes.length + ruleUpdates.length >= BATCH_WRITE_CHUNK_SIZE) {
-          flush();
-        }
-      }
 
       for (var i = 0; i < activeRules.length; i++) {
         if (Date.now() - startedAt > EXECUTION_TIME_BUDGET_MS) {
@@ -431,7 +485,7 @@ var ReminderOffsetEngine = (function () {
               stats.cancelled++;
             }
           }
-          staleRuleIds.push(rule.rule_id);
+          ruleDeletes.push(rule.rule_id);
           flushIfNeeded();
           continue;
         }
@@ -440,17 +494,39 @@ var ReminderOffsetEngine = (function () {
         if (!effectiveDue) continue;
 
         var channels = _parseJsonSafe_(rule.channels, ['telegram']);
-        var resolvedFireAts = _parseJsonSafe_(rule.resolved_fire_ats, {});
+        // 🐛 bugfix（外部审计 HIGH RISK 1，2026-07-15，核实属实后采纳，
+        // 实测复现）：resolved_fire_ats 里每个 channel 存的值，语义从
+        // "上次为这个 channel 解决掉的 fire_at"改成"上次解决掉这个
+        // channel 时，effectiveDue（任务的到期时间）是多少"。字段名本身
+        // 不改（rule.resolved_fire_ats 仍然对应 ReminderRules 表头那一
+        // 列的物理列名——重命名列头是数据迁移级别的变动，不是这次修复
+        // 的必要部分），只改存进去的值和比较方式，所以下面本地变量改叫
+        // resolvedDueAts 以准确反映新语义，跟 rule.resolved_fire_ats
+        // 这个列名区分开。
+        //
+        // 原来的问题：直接比较 fireAt 大小（fireAt <= lastResolved 就
+        // 跳过），隐含假设"同一个 channel 再次算出的 fireAt 只会不变或
+        // 变大"——这个假设只在"任务的到期时间不变或后移"时成立。一旦
+        // 用户把一个已经解决过的、还在 pending 的任务的到期时间改早，
+        // 重新算出的 fireAt 会跟着变小，反而满足"<= 上次"，被误判成
+        // "已经处理过"而跳过，用户收不到新到期时间对应的提醒——这正是
+        // 审计报告描述、且能通过下面场景F复现的问题。
+        //
+        // 现在改成直接比对 effectiveDue 本身是否等于"上次解决这个
+        // channel 时的 effectiveDue"：到期时间没变就不重复处理（跟原来
+        // 行为一致）；变了——不管是改早还是改晚——都判定为需要重新评估，
+        // 交给下面 fireAt 相关的时间判断决定现在要不要真的发送。这更准确
+        // 地对应"到期时间变了，这个 channel 的 offset 提醒也要跟着重新
+        // 算"这个设计初衷，而不是隐含一个"到期时间只会后移"的假设。
+        var resolvedDueAts = _parseJsonSafe_(rule.resolved_fire_ats, {});
         var ruleResolvedChanged = false;
 
         for (var c = 0; c < channels.length; c++) {
           var channel = channels[c];
           var fireAt = new Date(effectiveDue.getTime() - rule.offset_minutes * 60000);
 
-          // 🔧 实现阶段细化：不查 History，查 rule 自带的 resolved_fire_ats
-          // （文件头有完整说明）。
-          var lastResolved = resolvedFireAts[channel] ? new Date(resolvedFireAts[channel]) : null;
-          if (lastResolved && fireAt.getTime() <= lastResolved.getTime()) continue;
+          var lastResolvedDue = resolvedDueAts[channel] ? new Date(resolvedDueAts[channel]) : null;
+          if (lastResolvedDue && lastResolvedDue.getTime() === effectiveDue.getTime()) continue;
           if (fireAt.getTime() > Date.now()) continue; // 还没到时间
 
           var idempotencyKey = _computeIdempotencyKey_(rule.rule_id, channel, fireAt);
@@ -489,14 +565,14 @@ var ReminderOffsetEngine = (function () {
             historyInserts.push(_toHistoryRecord_(occurrence, 'sent', 'delivered'));
             occDeletes.push(idempotencyKey);
             pendingEvents.push(_reminderEvent_('REMINDER_SENT', occurrence, 'delivered'));
-            resolvedFireAts[channel] = fireAt.toISOString();
+            resolvedDueAts[channel] = effectiveDue.toISOString();
             ruleResolvedChanged = true;
             stats.sent++;
           } else if (occurrence.attempt_count >= MAX_RETRY_ATTEMPTS) {
             historyInserts.push(_toHistoryRecord_(occurrence, 'failed', (sendResult && sendResult.error) || 'unknown'));
             occDeletes.push(idempotencyKey);
             pendingEvents.push(_reminderEvent_('REMINDER_FAILED', occurrence, (sendResult && sendResult.error) || 'unknown'));
-            resolvedFireAts[channel] = fireAt.toISOString();
+            resolvedDueAts[channel] = effectiveDue.toISOString();
             ruleResolvedChanged = true;
             stats.failed++;
           } else {
@@ -508,16 +584,15 @@ var ReminderOffsetEngine = (function () {
         }
 
         if (ruleResolvedChanged) {
-          ruleUpdates.push({ rule_id: rule.rule_id, resolved_fire_ats: JSON.stringify(resolvedFireAts) });
+          ruleUpdates.push({ rule_id: rule.rule_id, resolved_fire_ats: JSON.stringify(resolvedDueAts) });
         }
       }
 
+      // MEDIUM RISK 1 fix：ruleDeletes 现在跟其余批量数组走同一条 flush
+      // 路径（循环内已经在 flushIfNeeded 里分批处理过一部分），这里只是
+      // 收尾——把最后不满一批的剩余部分写掉，不再需要额外的同步 forEach
+      // 逐个删除。
       flush();
-      if (staleRuleIds.length > 0) {
-        staleRuleIds.forEach(function (id) {
-          try { SheetUtils.deleteRowByKey_(RULES_SHEET, 'rule_id', id); } catch (e) { /* 见 _persistBatch_ 同款容错 */ }
-        });
-      }
 
       return stats;
     } finally {

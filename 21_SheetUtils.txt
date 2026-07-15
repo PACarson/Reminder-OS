@@ -239,6 +239,72 @@ var SheetUtils = (function () {
   }
 
   /**
+   * 🐛 2026-07-15 外部审计新增（MEDIUM RISK 1 关联，
+   * 26_ReminderOffsetEngine.gs checkOffsetReminders 清理失效规则那段，
+   * 核实属实后采纳）。
+   *
+   * 批量【按主键删除多行】：只读 keyHeader 这一列一次，定位给定的一批
+   * key 各自对应哪一行，按行号【降序】依次 deleteRow()。降序是必须的，
+   * 不是风格选择——deleteRow 物理删除一行后，原本在它下面的所有行行号
+   * 都会整体减一，如果按升序删，后面待删的行号会全部失效，删错行。
+   *
+   * 跟循环调用 deleteRowByKey_ 的差异：deleteRowByKey_ 每次调用都各自
+   * 完整地 getSheet_ + getHeaderMap_ + 读一次 key 列来定位，N 个 key 就要
+   * 付 N 次"打开表 + 读整列"的开销；这个函数只付一次，行号全部定位完成
+   * 后才开始真正的物理删除，不会随 key 数量增加而重复付出"打开表"这部分
+   * 的成本。
+   *
+   * @param {string} sheetName
+   * @param {string} keyHeader
+   * @param {Array} keyValues
+   * @returns {{deleted:number, notFound:string[]}}
+   */
+  function batchDeleteRowsByKey_(sheetName, keyHeader, keyValues) {
+    if (!keyValues || keyValues.length === 0) return { deleted: 0, notFound: [] };
+
+    var sheet = getSheet_(sheetName);
+    var headerMap = getHeaderMap_(sheet);
+    if (!(keyHeader in headerMap)) {
+      throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+    }
+
+    var keyColIndex = headerMap[keyHeader];
+    var lastRow = sheet.getLastRow();
+
+    var wantedKeys = {};
+    keyValues.forEach(function (k) {
+      if (k !== undefined && k !== null && k !== '') wantedKeys[String(k)] = true;
+    });
+
+    var rowNumsToDelete = [];
+    var foundKeys = {};
+    if (lastRow >= 2) {
+      var colValues = sheet.getRange(2, keyColIndex + 1, lastRow - 1, 1).getValues();
+      for (var i = 0; i < colValues.length; i++) {
+        var k = colValues[i][0];
+        if (k === '' || k === null || k === undefined) continue;
+        var kStr = String(k);
+        if (wantedKeys[kStr]) {
+          rowNumsToDelete.push(i + 2); // +2: 跳过表头 + 0基转1基
+          foundKeys[kStr] = true;
+        }
+      }
+    }
+
+    rowNumsToDelete.sort(function (a, b) { return b - a; }); // 降序，避免前面删除导致后面行号错位
+    rowNumsToDelete.forEach(function (rowNum) {
+      sheet.deleteRow(rowNum);
+    });
+
+    var notFound = [];
+    for (var keyStr in wantedKeys) {
+      if (!foundKeys[keyStr]) notFound.push(keyStr);
+    }
+
+    return { deleted: rowNumsToDelete.length, notFound: notFound };
+  }
+
+  /**
    * 批量 upsert：一次性读全表 → 内存合并 → 最多两次 setValues() 写回。
    *
    * 🐛 bugfix（2026-06-29，外部审计HIGH RISK 2，核实属实后采纳）：
@@ -469,17 +535,57 @@ var SheetUtils = (function () {
       }
     }
 
+    var matchedKeyStrs = Object.keys(rowNumByKey);
+    if (matchedKeyStrs.length === 0) return {};
+
+    // 🐛 bugfix（外部审计 HIGH RISK 3，2026-07-15，核实属实后采纳）：原来
+    // 这里对每个命中的 key、每个要读的字段都各自单独调一次
+    // sheet.getRange(rowNum, col).getValue()——命中的 key 越多、要读的
+    // 字段越多，同步网络调用次数就是两者的乘积，候选任务一多，执行时间
+    // 会迅速逼近6分钟上限，也容易撞日配额。改成：先算出命中的所有行号、
+    // 要读的所有列号各自的 [min,max] 包络，一次 getValues() 把这个矩形
+    // 区域整体读进内存（代价是可能顺带读到一些命中key之间、字段之间用
+    // 不上的行/列，但比起"每个单元格各一次调用"，用一次范围读换掉 O(N)
+    // 次调用，多读一点暂时用不上的数据远比多一次网络往返划算），再在
+    // 内存里按偏移量取值。I/O 调用次数从"命中数 × 字段数"降到最多2次
+    // （定位行号1次 + 整块取值1次），不再随命中的 key 数量或字段数量
+    // 线性增长。
+    var fieldCols = {}; // field -> 0基列索引，只保留 headerMap 里真的存在的字段
+    var minCol = null, maxCol = null;
+    fields.forEach(function (f) {
+      if (!headerMap.hasOwnProperty(f)) return;
+      fieldCols[f] = headerMap[f];
+      minCol = (minCol === null) ? headerMap[f] : Math.min(minCol, headerMap[f]);
+      maxCol = (maxCol === null) ? headerMap[f] : Math.max(maxCol, headerMap[f]);
+    });
+
     var result = {};
-    for (var keyStr in rowNumByKey) {
-      var rowNum = rowNumByKey[keyStr];
+    if (minCol === null) {
+      // fields 里没有任何一个字段在表头里存在——没有可读的列，直接给每个
+      // 命中的 key 一个空对象，维持跟原逻辑（headerMap.hasOwnProperty(f)
+      // 为 false 时跳过该字段）一致的外部表现，不额外发起任何范围读取。
+      matchedKeyStrs.forEach(function (kStr) { result[kStr] = {}; });
+      return result;
+    }
+
+    var minRow = null, maxRow = null;
+    matchedKeyStrs.forEach(function (kStr) {
+      var rowNum = rowNumByKey[kStr];
+      minRow = (minRow === null) ? rowNum : Math.min(minRow, rowNum);
+      maxRow = (maxRow === null) ? rowNum : Math.max(maxRow, rowNum);
+    });
+
+    var block = sheet.getRange(minRow, minCol + 1, maxRow - minRow + 1, maxCol - minCol + 1).getValues();
+
+    matchedKeyStrs.forEach(function (kStr) {
+      var rowOffset = rowNumByKey[kStr] - minRow;
       var obj = {};
       fields.forEach(function (f) {
-        if (headerMap.hasOwnProperty(f)) {
-          obj[f] = sheet.getRange(rowNum, headerMap[f] + 1).getValue();
-        }
+        if (!fieldCols.hasOwnProperty(f)) return;
+        obj[f] = block[rowOffset][fieldCols[f] - minCol];
       });
-      result[keyStr] = obj;
-    }
+      result[kStr] = obj;
+    });
     return result;
   }
 
@@ -514,12 +620,30 @@ var SheetUtils = (function () {
    * 无offset的日期时间字符串按本地时区解析，只有纯日期才按UTC，2026-06-25
    * 外部审计MEDIUM RISK 2复核确认过，详见25_ReminderEngine.gs历史记录）。
    */
+  /**
+   * 🐛 bugfix（2026-07-15，GAS Console 实测 TypeError: raw.match is not a
+   * function，报错点在 26_ReminderOffsetEngine.gs 的 _resolveEffectiveDueDatetime_）：
+   * raw 不一定是字符串——Sheets 对日期/日期时间格式的单元格，getValues()
+   * 会直接返回原生 Date 对象。isOverdue_（本文件下方）一直是安全的，
+   * 因为它在调用这里之前先 String(dueDateRaw) 过；但
+   * 26_ReminderOffsetEngine.gs 的 _resolveEffectiveDueDatetime_ 是直接把
+   * task.due_datetime/task.due_date 传进来，不经过这层转换——原来的
+   * raw.match(...) 假设 raw 一定是字符串，遇到 Date 对象直接抛错。
+   * 这里改成先识别 Date 类型直接返回（拷贝一份，不回传调用方传入的原始
+   * 引用），非 Date 的输入才按原逻辑走字符串解析——两个调用方都不用改，
+   * 按"任意 Sheet 单元格原始值"的实际形状把这个共用函数加固，不只是
+   * 针对这一个调用方打补丁。
+   */
   function parseDueDate_(raw) {
-    var dateOnlyMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (raw instanceof Date) {
+      return new Date(raw.getTime());
+    }
+    var str = String(raw === null || raw === undefined ? '' : raw).trim();
+    var dateOnlyMatch = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (dateOnlyMatch) {
       return new Date(Number(dateOnlyMatch[1]), Number(dateOnlyMatch[2]) - 1, Number(dateOnlyMatch[3]));
     }
-    return new Date(raw);
+    return new Date(str);
   }
 
   // ============ 共用：数值四舍五入 ============
@@ -572,6 +696,7 @@ var SheetUtils = (function () {
     getHeaderMap_: getHeaderMap_,
     upsertRowByKey_: upsertRowByKey_,
     deleteRowByKey_: deleteRowByKey_,
+    batchDeleteRowsByKey_: batchDeleteRowsByKey_,
     batchUpsertRowsByKey_: batchUpsertRowsByKey_,
     batchUpdateFieldsByKey_: batchUpdateFieldsByKey_,
     batchReadFieldsByKey_: batchReadFieldsByKey_,

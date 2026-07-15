@@ -176,6 +176,16 @@ function runTemporalEngineTests() {
   check('Immutable: schedule对象在传给三个计算函数之后不应该被改动',
     JSON.stringify(scheduleForImmutabilityCheck), beforeJSON);
 
+  // 🐛 回归测试（Architecture Review Finding 3 / 外部审计 LOW RISK 1，
+  // 2026-07-15）：上面那个测试只验证了"三个计算函数自己不修改
+  // schedule"，没有验证"外部直接对 schedule 赋值会不会生效"——parseRule
+  // 现在 Object.freeze 了返回值，这里直接补上这一层。
+  check('Immutable: parseRule返回的schedule应该是Object.isFrozen',
+    Object.isFrozen(scheduleForImmutabilityCheck), true);
+  scheduleForImmutabilityCheck.hour = 999; // sloppy mode下对冻结对象赋值会静默失败，不抛错
+  check('Immutable: 直接对已冻结的schedule字段赋值应该静默失败、不生效',
+    scheduleForImmutabilityCheck.hour, 9);
+
   // ---------- 两个消费者视角验证（证明没有 Reminder Bias）----------
   // Reminder 视角：每天吃药提醒
   var medsRule = TemporalEngine.parseRule({ type: 'daily', time: '08:00' });

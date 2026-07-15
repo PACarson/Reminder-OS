@@ -77,9 +77,24 @@ var Output = (function () {
       var body = JSON.parse(res.getContentText());
       if (!body.ok) {
         Logger.log('[Output] ❌ Telegram返回失败: ' + res.getContentText());
-      } else {
-        Logger.log('[Output] ✅ 发送成功 message_id=' + (body.result && body.result.message_id));
+        // 🐛 bugfix（2026-07-15，GAS Console 实测：调用方日志打出
+        // "error=undefined"，即使这里的日志明明打出了完整的
+        // error_code/description）：这个分支之前是 return body，也就是
+        // 原样转发 Telegram 的失败响应——Telegram 失败响应用的是
+        // error_code/description 两个字段，不是本函数其余三条失败路径
+        // （缺 token / 缺 chat_id / catch 块）统一使用的
+        // {ok:false, error:'...'} 形状。调用方（25_ReminderEngine.gs 的
+        // checkReminders、26_ReminderOffsetEngine.gs 的
+        // checkOffsetReminders）读的都是 sendResult.error，对这个分支
+        // 来说永远是 undefined——不是打日志用的字符串拼接错了，是这里
+        // 从一开始就没有把这个字段放进返回值。补一个 error 字段（优先取
+        // description，没有的话退化成 error_code），不删除原始的
+        // error_code/description（不丢信息，只是补齐调用方依赖的统一
+        // 字段）。
+        body.error = body.description || (body.error_code ? ('telegram_error_' + body.error_code) : 'unknown_telegram_error');
+        return body;
       }
+      Logger.log('[Output] ✅ 发送成功 message_id=' + (body.result && body.result.message_id));
       return body;
     } catch (e) {
       // 🐛 第四轮审计 MEDIUM RISK 2 关联：这里既可能是"请求根本没打到

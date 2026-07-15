@@ -17,6 +17,29 @@
  */
 
 function runReminderOffsetEngineTests() {
+  // 🐛 bugfix（2026-07-15，GAS Console 实测 ReferenceError: global is not
+  // defined，报错点在 resetAll()）：这份测试套件依赖 mocks.js 提供的
+  // 内存 Mock（__resetStore/__seedSheet/__mockPendingTasks 等），设计上
+  // 只能通过 Node 沙盒（run_offset_tests.js）运行——见本文件头部说明。
+  // 直接把这份文件贴进 Apps Script 编辑器运行 runReminderOffsetEngineTests
+  // 会在第一处 global.xxx 引用处失败，因为 GAS 运行时没有 Node 的
+  // global 对象。即使把 global 换成某个 GAS 侧的等价写法，紧接着
+  // __resetStore/__seedSheet 等 mock 函数依然不存在——不是换一个全局
+  // 对象名字能解决的，因为整套 mock 从未被加载进 GAS 项目，只存在于
+  // mocks.js 这个仅供本地/Node 使用的文件里。这里提前显式检测并给出
+  // 可操作的报错，取代深埋在 resetAll() 里、指向不明的 ReferenceError。
+  // 如果想在真实 GAS 环境里做端到端验证，应该直接调用
+  // checkOffsetReminders() 并指向一个专用的测试 Spreadsheet，而不是跑
+  // 这个函数——这个函数测的是逻辑本身，不是真实平台集成，两者故意分开。
+  if (typeof global === 'undefined' || typeof global.__resetStore !== 'function') {
+    var envMsg = '[ReminderOffsetEngineTests] 这份测试套件只能通过 Node 沙盒运行' +
+      '（项目根目录下执行 node run_offset_tests.js），不支持直接在 GAS 编辑器里跑——' +
+      '它依赖 mocks.js 提供的内存版 SheetUtils/QueryEngine/Output/LockService，GAS ' +
+      '运行时既没有 Node 的 global 对象，也不会加载这份 mock。';
+    Logger.log('❌ ' + envMsg);
+    throw new Error(envMsg);
+  }
+
   var pass = 0, fail = 0;
 
   function check(label, actual, expected) {
@@ -167,6 +190,43 @@ function runReminderOffsetEngineTests() {
   var rulesE = global.__readSheetRows('ReminderRules');
   var resolvedE = JSON.parse(rulesE[0].resolved_fire_ats);
   checkTrue('场景E: 规则的resolved_fire_ats应该记录telegram渠道已解决的时间', !!resolvedE.telegram);
+
+  // --- 场景 F（外部审计 HIGH RISK 1 回归测试，2026-07-15）：任务的到期
+  //     时间被改早，且改早之前这个 channel 已经针对"改早前"的到期时间
+  //     resolve 过一次——修复前，新算出的 fireAt 因为变小，会满足旧的
+  //     "fireAt <= 上次记录的值"判断，被误判成"已经处理过"而跳过，用户
+  //     收不到新到期时间对应的提醒。这里手工构造这个前置状态（不依赖
+  //     真的跑两轮 poll 来促成改期，直接模拟"这个 channel 曾经针对一个
+  //     更晚的到期时间 resolve 过"这个已发生的历史事实） ---
+  resetAll();
+  var dueOriginalF = new Date(Date.now() + 120 * 60000); // 改早之前：2小时后到期
+  global.__seedSheet('ReminderRules',
+    ['rule_id', 'task_id', 'chat_id', 'offset_minutes', 'offset_label', 'channels', 'rule_status', 'source', 'resolved_fire_ats', 'created_at'],
+    [{
+      rule_id: 'RULE-F', task_id: 'TASK-F', chat_id: 'CHAT-1', offset_minutes: 15,
+      offset_label: '15 minute(s) before', channels: JSON.stringify(['telegram']),
+      rule_status: 'active', source: 'manual',
+      // 模拟"改早之前"：telegram 渠道已经针对 dueOriginalF 这个到期时间
+      // resolve 过（字段名仍叫 resolved_fire_ats，但存的是到期时间快照，
+      // 不是 fire_at，见 26_ReminderOffsetEngine.gs 文件头 2026-07-15 修订）
+      resolved_fire_ats: JSON.stringify({ telegram: dueOriginalF.toISOString() }),
+      created_at: new Date().toISOString()
+    }]);
+  var dueRescheduledF = new Date(Date.now() - 10 * 60000); // 改早之后：10分钟前（已逾期）
+  global.__mockPendingTasks = [{ task_id: 'TASK-F', chat_id: 'CHAT-1', due_datetime: dueRescheduledF.toISOString() }];
+
+  var statsF = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景F（到期时间改早，改早前该channel已resolve过）: 不应该被旧到期时间的resolved记录误判为已处理，应该正常发送',
+    statsF.sent, 1);
+  check('场景F: 不应该因为TASK-F已有规则而重新生成默认规则', statsF.defaultRulesCreated, 0);
+  var historyF = global.__readSheetRows('ReminderHistory');
+  checkTrue('场景F: History里应该有RULE-F对应的sent记录（不是被跳过、完全没有记录）',
+    historyF.some(function (h) { return h.rule_id === 'RULE-F' && h.final_status === 'sent'; }));
+
+  // --- 场景 F 对照组：到期时间没有变化时，重复 poll 依然不应该重发
+  //     （确认场景F的修复没有连带破坏"没改期就不重发"这个基本幂等性） ---
+  var statsFRepeat = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景F对照组（紧接着再poll一次，到期时间不变）: 不应该重复发送', statsFRepeat.sent, 0);
 
   // ---------- Quiet Hours 门控（不改变materialize，只影响是否实际发送）----------
 

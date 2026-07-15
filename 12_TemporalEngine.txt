@@ -15,8 +15,12 @@
  * 2026-07-13 补丁：UEF Disposition Review 的 Fix Now 项（Finding 1、
  * Finding 2）。不涉及 Contract 支持的五种 type、不涉及 V1 已确定的行为
  * （闰年跳过、31号月末溢出等），纯粹是收紧对"不合法输入"的处理——
- * 详见各自改动点旁的注释。Finding 3（Object.freeze）按 disposition 结论
- * Fix Later，这份补丁不包含。
+ * 详见各自改动点旁的注释。Finding 3（Object.freeze）当时按 disposition
+ * 结论 Fix Later，这份补丁不包含。
+ *
+ * 2026-07-15 补丁：外部审计独立重新发现 Finding 3（Schedule Model
+ * 不可变约定没有运行时强制），予以采纳，parseRule 现在 return 之前
+ * Object.freeze(schedule)——详见 parseRule 里对应改动点的注释。
  */
 
 var TemporalEngine = (function () {
@@ -150,8 +154,24 @@ var TemporalEngine = (function () {
       schedule.day = ruleSpec.day;
     }
 
-    return schedule; // 不可变约定：往后不会再修改这个对象的任何字段，
-                      // 也不提供任何会修改自身字段的方法
+    // 🐛 bugfix（Architecture Review 2026-07-12 Finding 3 / 外部审计 LOW
+    // RISK 1，2026-07-15 提升为 Fix Now）：Finding 3 当时 Disposition 是
+    // Confirmed，但优先级评估为 Fix Later（跟 Finding 1/2 不同，Finding
+    // 1/2 是"不修就可能放行不合法输入"的 Contract 缺口，Finding 3 是
+    // "已经承诺的不可变约定没有运行时兜底"——严重度本身评级 LOW，且
+    // 评审当时 TemporalEngine 还没有任何真实调用方，"多个模块共享同一个
+    // schedule 引用"这个风险还没实际发生，按 Progression Rule 不必抢在
+    // 真实需要出现前动手，所以放进 Fix Later 批次，没有跟 Finding 1/2
+    // 一起在 2026-07-13 那次патch 里改）。这次外部审计重新独立发现同一个
+    // 问题并要求一并修复，评估影响后确认审查报告本身的结论依然成立
+    // （"return Object.freeze(schedule); 一行、对现有测试零影响"），予以
+    // 采纳。sloppy mode（GAS 默认运行时、这份文件被 eval 进 Node 沙盒时
+    // 也是）下对冻结对象赋值会静默失败、不抛错，不会让现有调用方意外
+    // 收到新的异常。
+    return Object.freeze(schedule); // 不可变约定：从约定升级为运行时强制——
+                                     // 冻结后任何后续赋值都会被 silently
+                                     // 拒绝（sloppy mode），不再只靠"没有
+                                     // 函数提供修改方法"这个弱保证
   }
 
   // ============ calculateNextOccurrence ============

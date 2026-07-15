@@ -142,7 +142,6 @@ var EventBus = (function () {
   function publishBatch(eventDrafts) {
     if (!eventDrafts || eventDrafts.length === 0) return [];
 
-    var rows = [];
     var published = [];
 
     eventDrafts.forEach(function (draft) {
@@ -155,30 +154,52 @@ var EventBus = (function () {
         _inExecIdentityCache_[draft.identity] = true;
       }
 
-      var event = {
+      published.push({
         event_id: _generateEventId_(),
         timestamp: new Date().toISOString(),
         type: draft.type,
         chat_id: draft.chatId || '',
         payload: draft.payload || {},
         source: draft.source || ''
-      };
-
-      rows.push([
-        event.event_id,
-        event.timestamp,
-        event.type,
-        event.chat_id,
-        JSON.stringify(event.payload),
-        event.source
-      ]);
-      published.push(event);
+      });
     });
 
-    if (rows.length > 0) {
+    // 🐛 bugfix（外部审计 HIGH RISK 2，2026-07-15，核实属实后采纳）：原来
+    // 用 getLastRow()+1 算起始行、一次 setValues() 写连续多行——"先读行数、
+    // 再写入"这两步不是原子操作。Reminder OS / Personal AI Core /
+    // Productivity OS 三个独立 Apps Script 项目共享同一张 Events 表，
+    // 任何一个项目在这两步之间插进自己的写入，都会让本次算出的起始行
+    // 过期，导致后写入的这一批把那次并发写入的内容覆盖掉——数据丢失，
+    // 不只是排序问题。
+    // 改成逐行调用 appendRow()：GAS 官方文档明确 appendRow 是原子操作
+    // （"prevents issues where a user asks for the last row, and then
+    // writes to that row, and an intervening mutation occurs between the
+    // last row and the write operation"）——服务端在处理这次调用的当下
+    // 才决定"当前实际的最后一行是哪一行"，不依赖调用方之前缓存的行号，
+    // 天然避免了上面这种竞态。本文件的单条 publish() 一直用的就是
+    // appendRow，也一直没被历次审计点名过这个问题，是同一个平台保证在
+    // 起作用。代价：从"1次 setValues() 写N行"退化成"最多N次 appendRow()
+    // 各写1行"——两个调用方（25_ReminderEngine.gs /
+    // 26_ReminderOffsetEngine.gs）的批量节奏都是 BATCH_WRITE_CHUNK_SIZE
+    // =5，单次 flush 最多5次同步调用，拿这点可接受的性能回退换掉数据
+    // 丢失风险，划算。
+    // ⚠️ 范围边界：这只保证 Reminder OS 自己这一侧的写入不再因为"读跟写
+    // 不是原子的一步"而丢数据；如果 Personal AI Core / Productivity OS
+    // 各自的 EventBus 副本内部也用类似 getLastRow()+setValues() 的写法，
+    // 那两个项目自己的这条线仍然需要各自去修，不是本项目这一次改动能
+    // 覆盖到的范围（本项目看不到那两个项目的代码，也没有办法替它们改）。
+    if (published.length > 0) {
       var sheet = _sheet_();
-      var startRow = sheet.getLastRow() + 1;
-      sheet.getRange(startRow, 1, rows.length, COLS.length).setValues(rows);
+      published.forEach(function (event) {
+        sheet.appendRow([
+          event.event_id,
+          event.timestamp,
+          event.type,
+          event.chat_id,
+          JSON.stringify(event.payload),
+          event.source
+        ]);
+      });
       _cachedEvents = null;
     }
 

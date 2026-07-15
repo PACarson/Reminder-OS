@@ -435,6 +435,17 @@ var ReminderEngine = (function () {
   function checkReminders() {
     _cleanupStaleRetryTrigger_();
 
+    // ⚠️ 范围说明（外部审计 HIGH RISK 4，2026-07-15 核实属实，评估后未在
+    // 代码层面"修复"）：下面这把锁只保证本项目自己的 checkReminders 不会
+    // 并发跑两次，不能阻止 Personal AI Core / Productivity OS 在本次
+    // 执行期间并发写共享的 Tasks 表——LockService 不跨 standalone 项目
+    // 生效，是平台限制。完整评估理由（两条审计建议的修法为什么都没有
+    // 单方面实施）见 26_ReminderOffsetEngine.gs checkOffsetReminders 里
+    // 对应位置的注释，这里是同一个结论，不重复展开。跟这条风险相关的
+    // 既有缓解措施是 MEDIUM RISK 1 修复引入的
+    // SheetUtils.batchUpdateFieldsByKey_（只对实际改动的字段做定点
+    // setValue，不整行/整表覆写），见 21_SheetUtils.gs 文件头和
+    // 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」。
     var lock = LockService.getScriptLock();
     try {
       lock.waitLock(LOCK_WAIT_MS);
