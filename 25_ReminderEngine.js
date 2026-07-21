@@ -157,7 +157,28 @@
  *                    （需要 Rider OS 当前里程数据，等 RiderConnector 接好）
  */
 
-var ReminderEngine = (function () {
+/**
+ * 🐛 2026-07-21 hotfix（Carson 发现并修复，我这边同步更新记录）：内部
+ * 模块变量原来叫 ReminderEngine，跟 20_ReminderEngine.gs（Unified
+ * Reminder Engine，2026-07-19 新增）的同名模块变量直接冲突——两个文件
+ * 都在全局作用域声明 var ReminderEngine = (function(){...})()，GAS 按
+ * 文件加载顺序（"20_" 排在 "25_" 前面）后加载的这份会覆盖前面那份，
+ * 20_ReminderEngine.gs 的 checkOffsetReminders() 全局转发函数因此调用到
+ * 这份文件（V1）的 ReminderEngine 对象上，报
+ * "ReminderEngine.checkOffsetReminders is not a function"。
+ *
+ * 这是我（Claude）在 2026-07-19 做 Unified Reminder Engine 改名时的疏忽
+ * ——明知这份文件按迁移计划要保留一段观察期，却没检查它自己的模块变量名
+ * 会不会跟新引擎撞名，等于是对我自己在同一次审查里替 92_ReminderEngine.gs
+ * 这个死代码文件标注过的"裸全局函数可能同名覆盖"这条风险视而不见。
+ *
+ * 修复：这份文件（V1，观察期结束后即将删除）的内部变量改名
+ * ReminderEngineV1，文件末尾的全局转发函数相应改成调用
+ * ReminderEngineV1.checkReminders()。选择改这份文件而不是改
+ * 20_ReminderEngine.gs，是因为这份文件本来就是要被删除的临时保留项，
+ * 20_ReminderEngine.gs 的 ReminderEngine 才是往后长期要用的名字。
+ */
+var ReminderEngineV1 = (function () {
 
   var REMINDER_INTERVAL_HOURS = {
     CRITICAL: 4,
@@ -670,10 +691,13 @@ var ReminderEngine = (function () {
 /**
  * GAS 的时间触发器（ScriptApp.newTrigger('checkReminders')）是按字符串
  * 名字在全局作用域找一个函数声明来绑定，不能绑定到
- * ReminderEngine.checkReminders 这种 IIFE 返回对象的属性。这个薄封装是
- * 唯一必须留在全局作用域的入口，纯转发，不含任何业务逻辑，也是
- * 1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识的名字，不能改名。
+ * ReminderEngineV1.checkReminders 这种 IIFE 返回对象的属性。这个薄封装是
+ * 唯一必须留在全局作用域的入口，纯转发，不含任何业务逻辑。函数名
+ * checkReminders 本身不需要改——11_Setup.gs 的 createTriggers() 现在
+ * 已经不再注册这个触发器（见 Unified Reminder Engine 条目），这个函数
+ * 目前没有任何触发器会实际调用它，留着只是这份文件在观察期内保持能被
+ * 手动运行/检查的状态。
  */
 function checkReminders() {
-  return ReminderEngine.checkReminders();
+  return ReminderEngineV1.checkReminders();
 }

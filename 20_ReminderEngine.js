@@ -1,6 +1,41 @@
 /**
- * 26_ReminderOffsetEngine.gs
- * Reminder OS — Time-Based Offset Reminder Engine（V1 实现）
+ * 20_ReminderEngine.gs   [原 26_ReminderEngine.gs — 2026-07-19
+ * 按 Unified Reminder Engine 决定改名，见下方最新条目]
+ * Reminder OS — 统一提醒引擎（Pre-Due + Overdue 两个阶段）
+ *
+ * 【2026-07-19 新增，ADR-2026-07-19-007，Carson 批准，Unified Reminder
+ * Engine】退役 25_ReminderEngine.gs（V1）——这次不是"再加一个功能"，是把
+ * V1 唯一还没被 V2 覆盖的能力（任务逾期未完成，按优先级间隔持续提醒直到
+ * 完成）搬进本文件，变成 Pre-Due 之外的第二个阶段，共用同一个触发器、
+ * 同一次轮询、同一套发送/重试/节流机制。完整决策记录见
+ * 00_ADR_007_Unified_Reminder_Engine.gs，架构评审见
+ * Unified-Reminder-Engine_Architecture-Review.md（Carson 2026-07-19
+ * 批准，含三处 refinement：OVERDUE_POLICY_CONFIG 加 enabled 开关、
+ * Quiet Hours 复用既有机制、ReminderHistory 加 policy_source）。
+ *
+ * 本次改动：
+ *   - DEFAULT_REMINDER_OFFSETS_MINUTES（扁平数组）→
+ *     DEFAULT_REMINDER_POLICY_CONFIG（按 priority 分组），_ensureRulesFromPolicy_
+ *     取默认值时改成查 task.priority 对应的分组。
+ *   - 新增 OVERDUE_POLICY_CONFIG（按 priority 分组，含 enabled/
+ *     interval_minutes/max_repeats）。
+ *   - 新增 Overdue 阶段：_processOverdueStage_()，复用
+ *     _resolveEffectiveDueDatetime_/_isWithinQuietHours_/_buildKeyboard_，
+ *     状态落在 Task 自己的 reminder_count/last_reminder_at 字段上（V1
+ *     已经在用、已经有真实历史数据的字段，不新建表、不需要数据迁移），
+ *     写法沿用 V1 的 SheetUtils.batchUpdateFieldsByKey_('Tasks', ...)。
+ *   - ReminderHistory 的 _toHistoryRecord_ 新增 stage（'pre_due'|
+ *     'overdue'）和 policy_source（'auto_default'|'user_override'|
+ *     'priority_default'）两个字段——表结构改动见 11_Setup.gs。
+ *   - checkOffsetReminders() 主循环末尾追加调用 Overdue 阶段，两个阶段
+ *     共用同一把 LockService 锁、同一次 EXECUTION_TIME_BUDGET_MS 预算。
+ *   - 顶层触发器函数保留旧名字 checkOffsetReminders()（不改函数名，只改
+ *     它做的事）——11_Setup.gs 的 createTriggers() 不需要跟着改触发器
+ *     绑定的名字，降低这次改动的连带范围。
+ *
+ * 25_ReminderEngine.gs 保留文件本身、只摘掉它的每小时触发器（见
+ * 11_Setup.gs）——按迁移计划先观察，确认本文件的 Overdue 阶段行为符合
+ * 预期之后再删除那个文件，不是这次改动的一部分。
  *
  * 【2026-07-17 新增，ADR-2026-07-17-006，Carson 批准】支持 Productivity OS
  * 新增的 Task.reminder_policy 字段——用户创建任务时可以直接覆盖默认提醒
@@ -22,8 +57,10 @@
  *
  * 职责边界（00_Project_Constitution.gs P9）：只回答"该在什么时候就一个
  * 已经存在的 task 发通知"，不碰 task 数据本身（只读 task_id、chat_id、
- * due_date/due_time/due_datetime、status，从不写回 Productivity OS 的
- * 表），不知道会议、日历、忙闲状态。
+ * due_date/due_time/due_datetime、status、priority，从不写回 Productivity
+ * OS 的表——唯一例外是 reminder_count/last_reminder_at 这两个字段，
+ * V1 时代就已经是 Reminder OS 有限写权限的一部分，见 P3），不知道会议、
+ * 日历、忙闲状态。
  *
  * 不依赖 12_TemporalEngine.gs——offset 是"到期时间减一个量"的简单减法，
  * 不是 recurrence 计算，ADR-004 已经明确排除"提前N天/N小时提醒"这类逻辑
@@ -71,7 +108,7 @@
  * schema 一旦确认，只需要改这一个函数。
  */
 
-var ReminderOffsetEngine = (function () {
+var ReminderEngine = (function () {
 
   // ---------- Config（Constitution P8：能用命名常量就不建 SecureConfig；
   // design doc §3 决策）----------
@@ -80,16 +117,48 @@ var ReminderOffsetEngine = (function () {
   var OCCURRENCES_SHEET = 'ReminderOccurrences';
   var HISTORY_SHEET = 'ReminderHistory';
 
-  // design doc §3：默认规则 offset（分钟），-1天/-1小时/-15分钟（你原始
-  // 例子）。空数组 = 关闭自动生成默认规则，同一个配置项兼作开关，不另加
-  // 布尔标志。
-  var DEFAULT_REMINDER_OFFSETS_MINUTES = [1440, 60, 15];
+  // 【2026-07-19 变更，Unified Reminder Engine】design doc §3 原来的默认
+  // offset 是一个不分 priority 的扁平数组；这次改成按 priority 分组
+  // （你这次 prompt 举的数值：LOW -30min／MEDIUM -1h／HIGH -2h+-30min／
+  // CRITICAL -1天+-2h+-30min）。取某个 task 的默认值时用 task.priority
+  // 查这个 CONFIG，查不到（priority 是空值或不认识的字符串）落到 MEDIUM，
+  // 见 _lookupPriorityConfig_。
+  var DEFAULT_REMINDER_POLICY_CONFIG = {
+    LOW:      { offsets_minutes: [30] },
+    MEDIUM:   { offsets_minutes: [60] },
+    HIGH:     { offsets_minutes: [120, 30] },
+    CRITICAL: { offsets_minutes: [1440, 120, 30] }
+  };
 
-  // design doc §5：Quiet Hours，24小时制本地时间。两者都是 null 表示关闭
-  // （跟上面同一个"哨兵值当开关"的约定）。按 disposition 决定，V1 暂不
-  // 启用——等真实使用经验，不是现在猜（见 Constitution 相关讨论）。
-  var QUIET_HOURS_START_HOUR = null;
-  var QUIET_HOURS_END_HOUR = null;
+  // 【2026-07-19 新增，Unified Reminder Engine，Overdue 阶段】任务逾期
+  // 未完成时的持续提醒策略，按 priority 分组，数值直接沿用
+  // 25_ReminderEngine.gs（V1）REMINDER_INTERVAL_HOURS 已经验证过的分级
+  // （4h/6h/12h/24h），只是换算成分钟、挪到这个统一的 CONFIG 形状里，
+  // 不是重新设计新数字。
+  //   enabled: 这个 priority 要不要有 Overdue 阶段——2026-07-19
+  //     refinement（Carson），false 时这个 priority 的任务逾期后完全
+  //     不会进入下面的判断，即使已经逾期也不提醒。
+  //   interval_minutes: 每隔多久重复一次。
+  //   max_repeats: 最多提醒几次，null = 不限（跟 V1 现状行为一致）。
+  var OVERDUE_POLICY_CONFIG = {
+    LOW:      { enabled: true, interval_minutes: 1440, max_repeats: null },
+    MEDIUM:   { enabled: true, interval_minutes: 720,  max_repeats: null },
+    HIGH:     { enabled: true, interval_minutes: 360,  max_repeats: null },
+    CRITICAL: { enabled: true, interval_minutes: 240,  max_repeats: null }
+  };
+
+  // design doc §5：Quiet Hours，24小时制本地时间。startHour/endHour 都是
+  // null 表示关闭（跟上面同一个"哨兵值当开关"的约定）。暂不启用——等真实
+  // 使用经验，不是现在猜（见 Constitution 相关讨论）。【2026-07-19
+  // refinement，Carson：(1) Overdue 阶段共用同一套配置和判断函数
+  // （_isWithinQuietHours_），不是重新做一套——这不是"预留架构以后再做"，
+  // 是已经建好、两个阶段共用，只是默认还没打开；(2) 两个独立的裸变量
+  // 改成一个对象（QUIET_HOURS_CONFIG），原因是裸的 number/null 变量导出
+  // 到 IIFE 外面之后是拷贝值不是引用，没法在导出的地方真正做到"可配置"
+  // ——包成一个对象之后，跟 DEFAULT_REMINDER_POLICY_CONFIG/
+  // OVERDUE_POLICY_CONFIG 同一种"导出对象引用，改这个对象的属性就是改真
+  // 实配置"的模式，不是这次唯一的特例。】
+  var QUIET_HOURS_CONFIG = { startHour: null, endHour: null };
 
   var LOCK_WAIT_MS = 10000;
   var HARD_EXECUTION_LIMIT_MS = 6 * 60 * 1000;
@@ -153,18 +222,30 @@ var ReminderOffsetEngine = (function () {
    * 有会议"——跟 availability analysis 的区别见 Constitution P9。
    */
   function _isWithinQuietHours_(now) {
-    if (QUIET_HOURS_START_HOUR === null || QUIET_HOURS_END_HOUR === null) return false;
+    var startHour = QUIET_HOURS_CONFIG.startHour;
+    var endHour = QUIET_HOURS_CONFIG.endHour;
+    if (startHour === null || endHour === null) return false;
     var hour = now.getHours();
-    if (QUIET_HOURS_START_HOUR <= QUIET_HOURS_END_HOUR) {
-      return hour >= QUIET_HOURS_START_HOUR && hour < QUIET_HOURS_END_HOUR;
+    if (startHour <= endHour) {
+      return hour >= startHour && hour < endHour;
     }
-    return hour >= QUIET_HOURS_START_HOUR || hour < QUIET_HOURS_END_HOUR; // 跨午夜窗口，如 22→8
+    return hour >= startHour || hour < endHour; // 跨午夜窗口，如 22→8
   }
 
   function _offsetLabel_(minutes) {
     if (minutes >= 1440 && minutes % 1440 === 0) return (minutes / 1440) + ' day(s) before';
     if (minutes >= 60 && minutes % 60 === 0) return (minutes / 60) + ' hour(s) before';
     return minutes + ' minute(s) before';
+  }
+
+  /**
+   * 【2026-07-19 新增，Unified Reminder Engine】DEFAULT_REMINDER_POLICY_CONFIG
+   * 和 OVERDUE_POLICY_CONFIG 共用的查找逻辑——priority 是空值、或者不是
+   * LOW/MEDIUM/HIGH/CRITICAL 这四个已知取值之一时，落到 MEDIUM，不让一个
+   * 意外的 priority 取值导致这个 task 完全没有默认策略/Overdue 策略可用。
+   */
+  function _lookupPriorityConfig_(configMap, priority) {
+    return configMap[priority] || configMap.MEDIUM;
   }
 
   // ---------- Rule generation from policy（ADR-006：reminder_policy override）----------
@@ -174,17 +255,20 @@ var ReminderOffsetEngine = (function () {
    * offset 生成规则"这一种情况。现在改名反映它实际做的事：对每个还没有
    * 任何规则行的 task（taskIdsWithRules 未命中——这个门槛本身不变，见下方
    * "落地时机"说明），读 task.reminder_policy 决定生成什么样的规则，而不是
-   * 无条件用 DEFAULT_REMINDER_OFFSETS_MINUTES。
+   * 无条件用 DEFAULT_REMINDER_POLICY_CONFIG 里 task.priority 对应的默认值
+   * （2026-07-19 起按 priority 分组，此前是一个不分 priority 的扁平数组，
+   * 见文件头 Unified Reminder Engine 条目）。
    *
    * task.reminder_policy 是 Productivity OS 新增的 Task 字段（JSON 字符串，
    * ActiveTasks 投影天然携带，QueryEngine.getPendingTasks() 不需要改动就能
    * 读到——跟当年 due_time/due_datetime 免改这个文件同一个理由），本函数
    * 通过 _parseJsonSafe_ 解析，解析失败或字段本身不存在都按 null 处理。
    *
-   * 三种情况（Carson 决定 #1/#3，2026-07-17）：
+   * 三种情况（Carson 决定 #1/#3，2026-07-17；默认值来源 2026-07-19 改为
+   * 按 priority 分组，见 Unified Reminder Engine 条目）：
    *   reminder_policy 为 null／解析失败
-   *     → 沿用 DEFAULT_REMINDER_OFFSETS_MINUTES，source: 'auto_default'，
-   *       跟改动前逐字节一致的行为。
+   *     → 按 task.priority 查 DEFAULT_REMINDER_POLICY_CONFIG，source:
+   *       'auto_default'。
    *   reminder_policy.offsets 是非空数组
    *     → 按这些 offset 生成，source: 'user_override'。
    *   reminder_policy.offsets 是空数组（用户显式声明"不要提前提醒"）
@@ -216,13 +300,17 @@ var ReminderOffsetEngine = (function () {
       var source;
 
       if (!policy || !policy.offsets) {
-        // null，或者字段存在但解析不出 offsets——按既有默认行为处理，
-        // 不是这次新增的分支，逐字节沿用改动前的逻辑和结果。
-        if (!DEFAULT_REMINDER_OFFSETS_MINUTES || DEFAULT_REMINDER_OFFSETS_MINUTES.length === 0) {
+        // null，或者字段存在但解析不出 offsets——按 priority 对应的默认
+        // 策略处理。【2026-07-19 变更，Unified Reminder Engine】这里从
+        // "固定用同一个扁平数组"改成"按 task.priority 查
+        // DEFAULT_REMINDER_POLICY_CONFIG"——priority 缺失/不认识时落到
+        // MEDIUM（_lookupPriorityConfig_），不是新增的静默失败模式。
+        var defaultPolicy = _lookupPriorityConfig_(DEFAULT_REMINDER_POLICY_CONFIG, task.priority);
+        if (!defaultPolicy.offsets_minutes || defaultPolicy.offsets_minutes.length === 0) {
           taskIdsWithRules[task.task_id] = true;
-          continue; // 默认策略本身关闭，没有规则可生成，但仍标记"已处理过"
+          continue; // 这个 priority 的默认策略本身关闭，没有规则可生成，但仍标记"已处理过"
         }
-        offsetMinutesList = DEFAULT_REMINDER_OFFSETS_MINUTES;
+        offsetMinutesList = defaultPolicy.offsets_minutes;
         source = 'auto_default';
       } else if (policy.offsets.length === 0) {
         // 用户在创建时显式声明"不要提前提醒"——不生成任何规则行，也不需要
@@ -253,7 +341,7 @@ var ReminderOffsetEngine = (function () {
       // 【计数口径跟改动前逐字节一致】改动前 stats.defaultRulesCreated 直接
       // 等于 newDefaultRules.length（数的是生成的规则【行数】，不是任务
       // 数）——1个task用3个默认offset会让这个数变成3，不是1（见
-      // 50_ReminderOffsetEngine_Tests.gs 场景A的断言）。user_override 沿用
+      // 50_ReminderEngine_Tests.gs 场景A的断言）。user_override 沿用
       // 同一个计数口径，两者才可比。
       if (source === 'auto_default') defaultRulesCreated += offsetMinutesList.length;
       if (source === 'user_override') overrideRulesCreated += offsetMinutesList.length;
@@ -265,8 +353,8 @@ var ReminderOffsetEngine = (function () {
 
   /**
    * 【ADR-2026-07-17-006 新增】把 reminder_policy.offsets 里的
-   * { value, unit } 换算成分钟——跟 DEFAULT_REMINDER_OFFSETS_MINUTES
-   * 已经是"分钟数组"保持同一种内部单位，_offsetLabel_ 等下游函数不需要
+   * { value, unit } 换算成分钟——跟 DEFAULT_REMINDER_POLICY_CONFIG 各
+   * priority 下的 offsets_minutes 保持同一种内部单位（分钟），_offsetLabel_ 等下游函数不需要
    * 认识 unit 这个概念。unit 无法识别时返回 null，调用点会把它过滤掉
    * （静默丢弃一个看不懂的 offset，好过让一整个 task 的规则生成失败）。
    */
@@ -311,7 +399,19 @@ var ReminderOffsetEngine = (function () {
     };
   }
 
-  function _toHistoryRecord_(occurrence, finalStatus, reason) {
+  /**
+   * 【2026-07-19 refinement，Carson】新增 stage/policySource 两个参数，
+   * 落到 History 表的 stage/policy_source 两列（schema 变更见
+   * 11_Setup.gs）——不是"以后要分析再加列"，这次直接做，避免以后真的要做
+   * 分析时还要再改一次表结构。stage 区分 Pre-Due/Overdue 两个阶段；
+   * policySource 区分这条提醒是默认策略还是用户自定义产生的（Pre-Due 阶段
+   * 直接照抄触发它的 Rule 的 source 字段；Overdue 阶段现在只有按 priority
+   * 分组的 CONFIG，还没有"单个任务自定义 Overdue 间隔"这种能力，统一记
+   * 'priority_default'，为将来可能支持这种自定义预留取值空间，不需要
+   * 再改表结构）。两个参数都不传时分别落到 'pre_due'/'auto_default'，
+   * 保护任何遗漏传参的调用点不会写出空值。
+   */
+  function _toHistoryRecord_(occurrence, finalStatus, reason, stage, policySource) {
     return {
       idempotency_key: occurrence.idempotency_key,
       rule_id: occurrence.rule_id,
@@ -323,7 +423,9 @@ var ReminderOffsetEngine = (function () {
       attempt_count: occurrence.attempt_count || 0,
       resolved_at: new Date().toISOString(),
       resolved_reason: reason,
-      archived_at: new Date().toISOString()
+      archived_at: new Date().toISOString(),
+      stage: stage || 'pre_due',
+      policy_source: policySource || 'auto_default'
     };
   }
 
@@ -338,7 +440,7 @@ var ReminderOffsetEngine = (function () {
         channel: occurrence.channel,
         reason: reason
       }),
-      source: 'ReminderOffsetEngine'
+      source: 'ReminderEngine'
     };
   }
 
@@ -352,7 +454,7 @@ var ReminderOffsetEngine = (function () {
       try {
         SheetUtils.batchUpsertRowsByKey_(HISTORY_SHEET, 'idempotency_key', historyInserts);
       } catch (e) {
-        Logger.log('[ReminderOffsetEngine] ❌ History 批量写入失败，本批不会从 Occurrences 删除' +
+        Logger.log('[ReminderEngine] ❌ History 批量写入失败，本批不会从 Occurrences 删除' +
           '（避免记录丢失），下一轮会重新尝试归档: ' + e.message);
         historyInserts = [];
         occurrenceDeleteKeys = []; // History 没写成功，不能删 Occurrences，宁可重复尝试也不丢记录
@@ -369,21 +471,21 @@ var ReminderOffsetEngine = (function () {
       try {
         SheetUtils.batchDeleteRowsByKey_(OCCURRENCES_SHEET, 'idempotency_key', occurrenceDeleteKeys);
       } catch (e) {
-        Logger.log('[ReminderOffsetEngine] ⚠️ 批量删除 Occurrences 记录失败: ' + e.message);
+        Logger.log('[ReminderEngine] ⚠️ 批量删除 Occurrences 记录失败: ' + e.message);
       }
     }
     if (occurrenceUpserts && occurrenceUpserts.length > 0) {
       try {
         SheetUtils.batchUpsertRowsByKey_(OCCURRENCES_SHEET, 'idempotency_key', occurrenceUpserts);
       } catch (e) {
-        Logger.log('[ReminderOffsetEngine] ❌ Occurrences 批量写入失败: ' + e.message);
+        Logger.log('[ReminderEngine] ❌ Occurrences 批量写入失败: ' + e.message);
       }
     }
     if (ruleUpdates && ruleUpdates.length > 0) {
       try {
         SheetUtils.batchUpdateFieldsByKey_(RULES_SHEET, 'rule_id', ruleUpdates);
       } catch (e) {
-        Logger.log('[ReminderOffsetEngine] ❌ Rules 状态更新失败: ' + e.message);
+        Logger.log('[ReminderEngine] ❌ Rules 状态更新失败: ' + e.message);
       }
     }
     if (ruleDeleteIds && ruleDeleteIds.length > 0) {
@@ -394,7 +496,7 @@ var ReminderOffsetEngine = (function () {
       try {
         SheetUtils.batchDeleteRowsByKey_(RULES_SHEET, 'rule_id', ruleDeleteIds);
       } catch (e) {
-        Logger.log('[ReminderOffsetEngine] ⚠️ 批量删除退休规则失败: ' + e.message);
+        Logger.log('[ReminderEngine] ⚠️ 批量删除退休规则失败: ' + e.message);
       }
     }
   }
@@ -404,7 +506,7 @@ var ReminderOffsetEngine = (function () {
     try {
       EventBus.publishBatch(events);
     } catch (e) {
-      Logger.log('[ReminderOffsetEngine] ⚠️ Events 审计记录失败（不影响已经落盘的功能性状态）: ' + e.message);
+      Logger.log('[ReminderEngine] ⚠️ Events 审计记录失败（不影响已经落盘的功能性状态）: ' + e.message);
     }
   }
 
@@ -424,7 +526,7 @@ var ReminderOffsetEngine = (function () {
         }
       }
     } catch (e) {
-      Logger.log('[ReminderOffsetEngine] 清理重试 trigger 出错（忽略）: ' + e.message);
+      Logger.log('[ReminderEngine] 清理重试 trigger 出错（忽略）: ' + e.message);
     }
     props.deleteProperty(RETRY_FLAG_KEY);
   }
@@ -462,6 +564,138 @@ var ReminderOffsetEngine = (function () {
     });
   }
 
+  // ---------- Overdue 阶段（新，2026-07-19，Unified Reminder Engine，
+  // 取代 25_ReminderEngine.gs）----------
+  // 状态落在 task.reminder_count/last_reminder_at 上，不新建表——这两个
+  // 字段是 V1 时代就在用、已经有真实历史数据的字段，Reminder OS 对它们的
+  // 有限写权限也是 P3 早就有的边界，不是这次新开的口子。
+
+  /**
+   * V1（25_ReminderEngine.gs）原来的消息里带"Reminded: Nx"计数和逾期视觉
+   * 标记——这次迁移过来时特意保留这个信息量（架构评审 §7 明确点出的
+   * "隐藏行为差异"之一），不是照抄 Pre-Due 阶段"⏰ 提醒（X分钟前）"那种
+   * 更简短的文案。
+   */
+  function _formatOverdueMessage_(task, effectiveDue) {
+    var lines = ['🔴 逾期提醒', (task.title || task.task_id), '到期: ' + effectiveDue.toLocaleString()];
+    var reminderCount = Number(task.reminder_count) || 0;
+    if (reminderCount > 0) lines.push('已提醒: ' + reminderCount + '次');
+    return lines.join('\n');
+  }
+
+  /**
+   * 对一批 pending tasks 跑一次 Overdue 判断——跟 Pre-Due 阶段共用同一次
+   * QueryEngine.getPendingTasks() 结果（调用点见 checkOffsetReminders），
+   * 不重新查一次。返回 { overdueSent: N }，并入主 stats。
+   *
+   * 判断顺序（architecture review §3 流程图）：
+   *   1. 能不能解析出到期时间（复用 _resolveEffectiveDueDatetime_，里程类/
+   *      解析失败的 task 直接跳过，不参与 Overdue，跟 Pre-Due 阶段一致的
+   *      处理方式，见架构评审 §7）
+   *   2. 到期时间是不是已经过了
+   *   3. 这个 priority 的 Overdue Policy 是不是 enabled
+   *   4. max_repeats 有没有设、有没有到上限
+   *   5. 距上次提醒是不是已经超过 interval_minutes（第一次提醒
+   *      last_reminder_at 为空，视为"超过"，立刻可以提醒）
+   *   6. 不在 Quiet Hours 里（复用 _isWithinQuietHours_，命中就跳过这一轮，
+   *      不提前更新 last_reminder_at，留到下一轮自然重新判断）
+   */
+  function _processOverdueStage_(pendingTasks, now) {
+    var taskUpdates = [];
+    var historyInserts = [];
+    var pendingEvents = [];
+    var overdueSent = 0;
+
+    for (var i = 0; i < pendingTasks.length; i++) {
+      var task = pendingTasks[i];
+      var effectiveDue = _resolveEffectiveDueDatetime_(task);
+      if (!effectiveDue) continue; // 解析不出到期时间（比如里程类），这一轮不参与 Overdue 判断
+      if (effectiveDue.getTime() > now.getTime()) continue; // 还没到期
+
+      var overduePolicy = _lookupPriorityConfig_(OVERDUE_POLICY_CONFIG, task.priority);
+      if (!overduePolicy.enabled) continue;
+
+      var reminderCount = Number(task.reminder_count) || 0;
+      if (overduePolicy.max_repeats !== null && overduePolicy.max_repeats !== undefined &&
+        reminderCount >= overduePolicy.max_repeats) continue;
+
+      var lastReminderAt = task.last_reminder_at ? new Date(task.last_reminder_at) : null;
+      if (lastReminderAt && !isNaN(lastReminderAt.getTime())) {
+        var minutesSinceLast = (now.getTime() - lastReminderAt.getTime()) / 60000;
+        if (minutesSinceLast < overduePolicy.interval_minutes) continue;
+      }
+
+      if (_isWithinQuietHours_(now)) continue; // 这一轮不发，下一轮再判断
+
+      var sendResult = Output.send('telegram', task.chat_id, _formatOverdueMessage_(task, effectiveDue), {
+        keyboard: _buildKeyboard_(task)
+      });
+
+      if (sendResult && sendResult.ok) {
+        var newCount = reminderCount + 1;
+        taskUpdates.push({ task_id: task.task_id, reminder_count: newCount, last_reminder_at: now.toISOString() });
+        var idemKey = 'overdue:' + task.task_id + ':' + Math.floor(now.getTime() / 60000);
+        historyInserts.push({
+          idempotency_key: idemKey,
+          rule_id: '',
+          task_id: task.task_id,
+          chat_id: task.chat_id,
+          channel: 'telegram',
+          computed_fire_at: now.toISOString(),
+          final_status: 'sent',
+          attempt_count: 1,
+          resolved_at: now.toISOString(),
+          resolved_reason: 'overdue_repeat',
+          archived_at: now.toISOString(),
+          stage: 'overdue',
+          policy_source: 'priority_default'
+        });
+        pendingEvents.push({
+          type: 'REMINDER_SENT',
+          chat_id: task.chat_id,
+          payload: JSON.stringify({ task_id: task.task_id, stage: 'overdue', reminder_count: newCount }),
+          source: 'ReminderEngine'
+        });
+        overdueSent++;
+      }
+      // 发送失败：不更新 reminder_count/last_reminder_at，下一轮自然重试
+      // ——跟 V1 现状行为一致（V1 对失败也没有独立的重试预算，靠下一次
+      // 触发器自然重来），不是这次改动引入的新行为。
+    }
+
+    // 顺序跟 V1 的 _persistBatch/_publishPendingEvents 一致：功能性状态
+    // （reminder_count/last_reminder_at，驱动"还要不要提醒"的判断）先落盘，
+    // History/Events 这类审计记录其次——哪怕后两者失败，功能状态已经
+    // 安全落盘，不会因为审计记录失败而导致重复提醒。
+    if (taskUpdates.length > 0) {
+      try {
+        var result = SheetUtils.batchUpdateFieldsByKey_('Tasks', 'task_id', taskUpdates);
+        if (result && result.notFound && result.notFound.length > 0) {
+          Logger.log('[ReminderEngine] ⚠️ Overdue: 以下 task_id 在 Tasks 表里找不到（可能被并发' +
+            '删除/改动），提醒已发出但状态未落盘: ' + result.notFound.join(','));
+        }
+      } catch (e) {
+        Logger.log('[ReminderEngine] ❌ Overdue reminder_count/last_reminder_at 批量写入失败: ' + e.message);
+      }
+    }
+    if (historyInserts.length > 0) {
+      try {
+        SheetUtils.batchUpsertRowsByKey_(HISTORY_SHEET, 'idempotency_key', historyInserts);
+      } catch (e) {
+        Logger.log('[ReminderEngine] ❌ Overdue History 写入失败: ' + e.message);
+      }
+    }
+    if (pendingEvents.length > 0) {
+      try {
+        EventBus.publishBatch(pendingEvents);
+      } catch (e) {
+        Logger.log('[ReminderEngine] ⚠️ Overdue Events 审计记录失败（不影响已落盘的 Tasks 状态）: ' + e.message);
+      }
+    }
+
+    return { overdueSent: overdueSent };
+  }
+
   // ---------- 主流程（design doc §5，含 resolved_fire_ats 细化）----------
 
   function checkOffsetReminders() {
@@ -494,15 +728,15 @@ var ReminderOffsetEngine = (function () {
     try {
       lock.waitLock(LOCK_WAIT_MS);
     } catch (e) {
-      Logger.log('[ReminderOffsetEngine] 前序执行尚未结束，跳过本次，安排重试');
+      Logger.log('[ReminderEngine] 前序执行尚未结束，跳过本次，安排重试');
       _scheduleRetry_();
-      return { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0, overrideRulesCreated: 0 };
+      return { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0, overrideRulesCreated: 0, overdueSent: 0 };
     }
 
     PropertiesService.getScriptProperties().deleteProperty(RETRY_COUNT_KEY);
 
     var startedAt = Date.now();
-    var stats = { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0, overrideRulesCreated: 0 };
+    var stats = { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0, overrideRulesCreated: 0, overdueSent: 0 };
 
     try {
       var allRules = _readAllRows_(RULES_SHEET);
@@ -570,7 +804,7 @@ var ReminderOffsetEngine = (function () {
 
       for (var i = 0; i < activeRules.length; i++) {
         if (Date.now() - startedAt > EXECUTION_TIME_BUDGET_MS) {
-          Logger.log('[ReminderOffsetEngine] 时间预算耗尽，剩余规则留给下次触发器');
+          Logger.log('[ReminderEngine] 时间预算耗尽，剩余规则留给下次触发器');
           break;
         }
         var rule = activeRules[i];
@@ -583,7 +817,7 @@ var ReminderOffsetEngine = (function () {
             var occ = occurrenceByKey[key];
             if (occ.rule_id === rule.rule_id &&
               (occ.status === 'pending' || occ.status === 'failed' || occ.status === 'snoozed')) {
-              historyInserts.push(_toHistoryRecord_(occ, 'cancelled', 'task_no_longer_pending'));
+              historyInserts.push(_toHistoryRecord_(occ, 'cancelled', 'task_no_longer_pending', 'pre_due', rule.source));
               occDeletes.push(occ.idempotency_key);
               pendingEvents.push(_reminderEvent_('REMINDER_CANCELLED', occ, 'task_no_longer_pending'));
               stats.cancelled++;
@@ -666,14 +900,14 @@ var ReminderOffsetEngine = (function () {
           occurrence.last_attempt_at = new Date().toISOString();
 
           if (sendResult && sendResult.ok) {
-            historyInserts.push(_toHistoryRecord_(occurrence, 'sent', 'delivered'));
+            historyInserts.push(_toHistoryRecord_(occurrence, 'sent', 'delivered', 'pre_due', rule.source));
             occDeletes.push(idempotencyKey);
             pendingEvents.push(_reminderEvent_('REMINDER_SENT', occurrence, 'delivered'));
             resolvedDueAts[channel] = effectiveDue.toISOString();
             ruleResolvedChanged = true;
             stats.sent++;
           } else if (occurrence.attempt_count >= MAX_RETRY_ATTEMPTS) {
-            historyInserts.push(_toHistoryRecord_(occurrence, 'failed', (sendResult && sendResult.error) || 'unknown'));
+            historyInserts.push(_toHistoryRecord_(occurrence, 'failed', (sendResult && sendResult.error) || 'unknown', 'pre_due', rule.source));
             occDeletes.push(idempotencyKey);
             pendingEvents.push(_reminderEvent_('REMINDER_FAILED', occurrence, (sendResult && sendResult.error) || 'unknown'));
             resolvedDueAts[channel] = effectiveDue.toISOString();
@@ -698,6 +932,14 @@ var ReminderOffsetEngine = (function () {
       // 逐个删除。
       flush();
 
+      // 【2026-07-19 新增，Unified Reminder Engine】Overdue 阶段——复用
+      // 上面已经查过的同一份 pendingTasks（不重新查一次 QueryEngine），
+      // 在 Pre-Due 阶段的批量持久化（flush()）完成之后跑，两个阶段共用
+      // 同一把锁、同一次 EXECUTION_TIME_BUDGET_MS 预算，不是独立的第二次
+      // 加锁/查询。
+      var overdueResult = _processOverdueStage_(pendingTasks, new Date());
+      stats.overdueSent = overdueResult.overdueSent;
+
       return stats;
     } finally {
       lock.releaseLock();
@@ -713,15 +955,30 @@ var ReminderOffsetEngine = (function () {
     _offsetLabel_: _offsetLabel_,
     _offsetToMinutes_: _offsetToMinutes_,
     _ensureRulesFromPolicy_: _ensureRulesFromPolicy_,
-    _ensureDefaultRules_: _ensureDefaultRules_ // @deprecated 别名，见该函数头注释
+    _ensureDefaultRules_: _ensureDefaultRules_, // @deprecated 别名，见该函数头注释
+    _lookupPriorityConfig_: _lookupPriorityConfig_,
+    _processOverdueStage_: _processOverdueStage_,
+    _formatOverdueMessage_: _formatOverdueMessage_,
+    // 【2026-07-19 refinement，Carson："fully configurable"】这两份 CONFIG
+    // 直接导出（不是拷贝），线上运行时可以在 Apps Script 编辑器里临时改
+    // ReminderEngine.OVERDUE_POLICY_CONFIG.LOW.enabled 之类的值做快速验证
+    // （改动只在当次执行进程内生效，不持久化——真正要永久调整还是改这个
+    // 文件顶部的常量），单元测试也是通过这个导出直接验证 enabled/
+    // max_repeats 等字段的效果，不需要为了测试专门开后门。
+    DEFAULT_REMINDER_POLICY_CONFIG: DEFAULT_REMINDER_POLICY_CONFIG,
+    OVERDUE_POLICY_CONFIG: OVERDUE_POLICY_CONFIG,
+    QUIET_HOURS_CONFIG: QUIET_HOURS_CONFIG
   };
 })();
 
 /**
  * 顶层 trigger 绑定函数——GAS 的 time-based trigger 只能绑定全局函数名，
- * 不能绑定 IIFE 内部方法，镜像 25_ReminderEngine.gs 的 checkReminders()
- * 同款薄转发模式（design doc §10 file map）。
+ * 不能绑定 IIFE 内部方法。【2026-07-19，Unified Reminder Engine】函数名
+ * 保留 checkOffsetReminders 不改——11_Setup.gs 的 createTriggers()
+ * 不需要跟着改触发器绑定的名字，降低这次改动的连带范围；这个名字现在
+ * 触发的是 Pre-Due + Overdue 两个阶段，不再只是"Offset"，但改名字牵动
+ * 触发器重新绑定，价值不足以抵消风险，保留旧名字是刻意决定，不是疏漏。
  */
 function checkOffsetReminders() {
-  return ReminderOffsetEngine.checkOffsetReminders();
+  return ReminderEngine.checkOffsetReminders();
 }

@@ -40,20 +40,35 @@
  *   2. 设置 TELEGRAM_TOKEN、TELEGRAM_CHAT_ID（跟 Core 项目一样的值——
  *      Reminder OS 自己直接发 Telegram 消息，不经过 Core，需要自己的
  *      Token，见本项目 4_Integration/40_Output.gs）
- *   3. 跑一次 createTriggers() —— 挂上 checkReminders（每小时）
+ *   3. 跑一次 createTriggers() —— 挂上 checkOffsetReminders（每5分钟，
+ *      2026-07-19 起承担 Pre-Due + Overdue 两个阶段，见下方 Unified
+ *      Reminder Engine 条目）
  *
  * 不需要 Deploy as Web App（Reminder OS 不接 Telegram webhook，只是被动
  * 触发器 + 主动发消息），也不需要 registerWebhook()。
  *
+ * 🆕 2026-07-19（Unified Reminder Engine，ADR-2026-07-19-007，Carson
+ * 批准）：createTriggers() 不再挂 checkReminders（V1，25_ReminderEngine.gs
+ * 的每小时触发器）——V1 唯一还没被覆盖的能力（逾期持续提醒）已经搬进
+ * checkOffsetReminders() 的 Overdue 阶段（20_ReminderEngine.gs，原
+ * 26_ReminderOffsetEngine.gs）。25_ReminderEngine.gs 这个文件本身没有删
+ * ——按迁移计划，先观察 Overdue 阶段的实际表现，确认没问题再删文件，这次
+ * 只摘掉触发器，让 V1 停止运作。再次运行 createTriggers() 时，如果项目里
+ * 还残留任何 checkReminders 触发器（比如手动加过），会被一并清掉，不会
+ * 重新创建。
+ *
  * 🆕 2026-07-14（Time-Based Offset Reminder Engine）：上面这段"不需要建
  * 任何新表"从这次起不再完全成立——ReminderRules/ReminderOccurrences/
  * ReminderHistory 三张表由本项目自己拥有，需要额外跑一次
- * setupOffsetReminderSheets()（幂等，已存在就跳过）。createTriggers() 也
- * 相应新增了 checkOffsetReminders（每5分钟）。完整设计依据见
+ * setupOffsetReminderSheets()（幂等，已存在就跳过）。完整设计依据见
  * Reminder-OS_Time-Based-Reminder-Engine_Design-Proposal.md §9。
  */
 
 function createTriggers() {
+  // 【2026-07-19 变更】handlerNames 移除 'checkReminders'——不再清理后
+  // 重建它，只清理不重建（如果项目里还残留旧的 checkReminders 触发器，
+  // 下面这段 forEach 依然会把它删掉，效果等同于"这次运行之后 V1 不会再
+  // 被触发"，不需要额外手动操作）。
   var handlerNames = ['checkReminders', 'checkOffsetReminders'];
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (handlerNames.indexOf(t.getHandlerFunction()) !== -1) {
@@ -61,19 +76,14 @@ function createTriggers() {
     }
   });
 
-  ScriptApp.newTrigger('checkReminders').timeBased().everyHours(1).create();
-
-  // 🆕 2026-07-14（Time-Based Offset Reminder Engine 设计 §6）：单独的
-  // trigger，不是把 checkOffsetReminders 塞进 checkReminders 里合并成
-  // 一个——V1 现有的按优先级重复提醒逻辑跟这里新的一次性 offset 提醒是
-  // 两套不同的行为，分开挂 trigger 可以让两边独立跑一段时间，不需要
-  // 一次性切换。5分钟是 GAS 时间触发器支持的最小粒度，跟设计文档里最细
-  // 的 offset 选项（5分钟前）对齐。
+  // 5分钟是 GAS 时间触发器支持的最小粒度，跟设计文档里最细的 offset 选项
+  // （5分钟前）对齐。2026-07-19 起这一个触发器同时驱动 Pre-Due 和 Overdue
+  // 两个阶段（Unified Reminder Engine），不再只对应"一次性提前提醒"。
   ScriptApp.newTrigger('checkOffsetReminders').timeBased().everyMinutes(5).create();
 
   Logger.log('✅ Reminder OS 自己的触发器挂好了:');
-  Logger.log('  checkReminders — 每小时（V1，按优先级重复提醒）');
-  Logger.log('  checkOffsetReminders — 每5分钟（Offset Reminder Engine，一次性提前提醒）');
+  Logger.log('  checkOffsetReminders — 每5分钟（Unified Reminder Engine，Pre-Due + Overdue 两个阶段）');
+  Logger.log('  （V1 的 checkReminders 已停用——25_ReminderEngine.gs 文件还在，按迁移计划观察期结束后再删）');
 }
 
 /**
@@ -97,7 +107,8 @@ function setupOffsetReminderSheets() {
     ReminderOccurrences: ['idempotency_key', 'rule_id', 'task_id', 'chat_id', 'channel',
       'computed_fire_at', 'status', 'attempt_count', 'last_attempt_at', 'snoozed_until'],
     ReminderHistory: ['idempotency_key', 'rule_id', 'task_id', 'chat_id', 'channel',
-      'computed_fire_at', 'final_status', 'attempt_count', 'resolved_at', 'resolved_reason', 'archived_at']
+      'computed_fire_at', 'final_status', 'attempt_count', 'resolved_at', 'resolved_reason', 'archived_at',
+      'stage', 'policy_source'] // 【2026-07-19 新增，Unified Reminder Engine】见下方 migrateSchemaReminderHistoryStages()
   };
 
   Object.keys(schemas).forEach(function (sheetName) {
@@ -111,6 +122,43 @@ function setupOffsetReminderSheets() {
     sheet.setFrozenRows(1);
     Logger.log('✅ 已创建 ' + sheetName + '，表头: ' + schemas[sheetName].join(', '));
   });
+}
+
+/**
+ * 【2026-07-19 新增，Unified Reminder Engine，ADR-2026-07-19-007】给已经
+ * 存在的 ReminderHistory 表追加 stage/policy_source 两列——只对已经跑过
+ * setupOffsetReminderSheets() 的既有部署需要，全新部署走上面的
+ * setupOffsetReminderSheets() 就会直接带上这两列，不需要再跑这个。幂等
+ * ——列已存在时跳过。存量行这两列留空，20_ReminderEngine.gs 的
+ * _toHistoryRecord_ 只在读的时候才用得到这两个字段，History 表本身在
+ * 热路径里从不被读（见该文件文件头"🔧 实现阶段发现的设计细化"第2点），
+ * 留空不影响任何功能，纯粹是历史记录不完整而已，不需要回填。
+ */
+function migrateSchemaReminderHistoryStages() {
+  var id = SecureConfig.getKey('SPREADSHEET_ID');
+  if (!id) {
+    Logger.log('❌ SPREADSHEET_ID 没设置');
+    return;
+  }
+  var sheet = SpreadsheetApp.openById(id).getSheetByName('ReminderHistory');
+  if (!sheet) {
+    Logger.log('ℹ️ ReminderHistory 还不存在，交给 setupOffsetReminderSheets() 去建，这里不用管');
+    return;
+  }
+
+  var lastCol = sheet.getLastColumn();
+  var existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var toAdd = ['stage', 'policy_source'].filter(function (col) {
+    return existingHeaders.indexOf(col) === -1;
+  });
+
+  if (toAdd.length === 0) {
+    Logger.log('ℹ️ ReminderHistory 已经有 stage/policy_source 两列，无需迁移');
+    return;
+  }
+
+  sheet.getRange(1, lastCol + 1, 1, toAdd.length).setValues([toAdd]);
+  Logger.log('✅ ReminderHistory 新增列: ' + toAdd.join(', '));
 }
 
 function runDiagnostics() {
@@ -185,33 +233,34 @@ function runDiagnostics() {
   }
 
   // 🐛 新增（2026-07-10，第四轮外部审计 HIGH RISK 2 关联，核实属实后
-  // 采纳）：checkReminders 名下当前的 trigger 数量。稳态应该只有1个
-  // （createTriggers() 建的每小时那个）。如果是2个，多半是恰好有一次
-  // 锁竞争重试在排队中（正常，见下面的 Script Property 是否也有记录）；
-  // 如果超过2个，或者下面显示没有重试记录但数量却大于1，说明大概率是
-  // 25_ReminderEngine.gs 的 _cleanupStaleRetryTrigger_ 没生效、trigger
-  // 在累积，需要手动排查——临时手段是重新跑一次本文件的 createTriggers()，
-  // 它会把 checkReminders 名下所有 trigger 清掉重建。
+  // 采纳）：checkReminders 名下当前的 trigger 数量。
+  // 【2026-07-19 变更，Unified Reminder Engine，ADR-2026-07-19-007】
+  // createTriggers() 不再挂 checkReminders（V1 已经停用，见该函数头
+  // 注释），稳态应该是 0，不再是 1。如果这里显示大于0，说明有人手动加过
+  // 触发器，或者 V1 还没真正停用——跑一次本文件的 createTriggers() 会把它
+  // 清掉。
   var reminderTriggers = ScriptApp.getProjectTriggers().filter(function (t) {
     return t.getHandlerFunction() === 'checkReminders';
   });
-  Logger.log((reminderTriggers.length === 1 ? '✅' : '⚠️') +
-    ' checkReminders 名下当前有 ' + reminderTriggers.length + ' 个 trigger（稳态应为1个）');
+  Logger.log((reminderTriggers.length === 0 ? '✅' : '⚠️') +
+    ' checkReminders 名下当前有 ' + reminderTriggers.length + ' 个 trigger（V1 已停用，稳态应为0个）');
   var retryTriggerId = PropertiesService.getScriptProperties().getProperty('REMINDER_ENGINE_RETRY_TRIGGER_ID');
   var retryCount = PropertiesService.getScriptProperties().getProperty('REMINDER_ENGINE_RETRY_COUNT');
   if (retryTriggerId || retryCount) {
     Logger.log('ℹ️ 当前有锁竞争重试记录在案（trigger id=' + retryTriggerId + '，已重试次数=' +
-      (retryCount || '0') + '）——如果上面 trigger 数是2，大概率就是它，不算异常');
+      (retryCount || '0') + '）——V1 已停用，这条记录理论上不该再出现，如果看到说明 V1 最近还跑过');
   }
 
-  // 🆕 2026-07-14（Time-Based Offset Reminder Engine）：新引擎自己的
-  // trigger + 三张自己拥有的表，跟上面 V1 的检查是同一个思路，key 名字
-  // 换成这个引擎自己的前缀（见 26_ReminderOffsetEngine.gs 文件头）。
+  // 🆕 2026-07-14（Time-Based Offset Reminder Engine），2026-07-19 起
+  // 承担 Pre-Due + Overdue 两个阶段（Unified Reminder Engine）：这个
+  // trigger 现在是 Reminder OS 唯一的触发器，跟上面 V1 的检查是同一个
+  // 思路，key 名字换成这个引擎自己的前缀（见 20_ReminderEngine.gs
+  // 文件头）。
   var offsetTriggers = ScriptApp.getProjectTriggers().filter(function (t) {
     return t.getHandlerFunction() === 'checkOffsetReminders';
   });
   Logger.log((offsetTriggers.length === 1 ? '✅' : '⚠️') +
-    ' checkOffsetReminders 名下当前有 ' + offsetTriggers.length + ' 个 trigger（稳态应为1个）');
+    ' checkOffsetReminders 名下当前有 ' + offsetTriggers.length + ' 个 trigger（稳态应为1个，Unified Reminder Engine 的唯一触发器）');
   var offsetRetryTriggerId = PropertiesService.getScriptProperties().getProperty('REMINDER_OFFSET_ENGINE_RETRY_TRIGGER_ID');
   var offsetRetryCount = PropertiesService.getScriptProperties().getProperty('REMINDER_OFFSET_ENGINE_RETRY_COUNT');
   if (offsetRetryTriggerId || offsetRetryCount) {

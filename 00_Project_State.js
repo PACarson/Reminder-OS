@@ -3,7 +3,12 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-17 — 支持 Productivity OS 新增的
+ * LAST_UPDATED: 2026-07-19 — Unified Reminder Engine（ADR-2026-07-19-007）：
+ * 退役 V1（25_ReminderEngine.gs 停用触发器），Overdue 阶段并入
+ * 20_ReminderEngine.gs（原 26_ReminderOffsetEngine.gs），reminder_policy
+ * 和优先级默认策略、Overdue 持续提醒现在是同一个引擎的两个阶段，不是
+ * 两套独立机制。完整决策记录见 00_ADR_007_Unified_Reminder_Engine.gs。
+ * 2026-07-17 — 支持 Productivity OS 新增的
  * Task.reminder_policy 字段（创建任务时覆盖默认提醒策略），
  * 26_ReminderOffsetEngine.gs 的 _ensureDefaultRules_ 改名并扩展为读取
  * reminder_policy 优先于默认常量，落地时机采用窄口径（只在首次物化
@@ -316,6 +321,58 @@
  *   50_ReminderOffsetEngine_Tests.gs 新增场景 G/H/I + _offsetToMinutes_
  *   的纯函数测试。本次改动完全不涉及 Personal AI Core、Connector Layer、
  *   12_TemporalEngine.gs、22_QueryEngine.gs。
+ *
+ * - 2026-07-19：Unified Reminder Engine——上一条实测发现 V1（按到期临近
+ *   度持续提醒）和 V2（reminder_policy 驱动的一次性提前提醒）互相独立，
+ *   显式覆盖了 reminder_policy 的任务仍然会收到 V1 的独立提醒。完整两轮
+ *   架构评审见 Reminder-Engine-Consolidation_Architecture-Review.md +
+ *   Unified-Reminder-Engine_Architecture-Review.md，正式决策记录见
+ *   00_ADR_007_Unified_Reminder_Engine.gs，Carson 2026-07-19 批准后实现。
+ *
+ *   26_ReminderOffsetEngine.gs 改名 20_ReminderEngine.gs（内部模块变量
+ *   ReminderOffsetEngine 同步改名 ReminderEngine，trigger 绑定的全局
+ *   函数名 checkOffsetReminders 保留不改，降低连带范围）。DEFAULT_
+ *   REMINDER_OFFSETS_MINUTES（不分优先级的扁平数组）改成按 priority
+ *   分组的 DEFAULT_REMINDER_POLICY_CONFIG。新增 OVERDUE_POLICY_CONFIG
+ *   （interval_minutes/enabled/max_repeats，按 priority 分组，数值沿用
+ *   V1 REMINDER_INTERVAL_HOURS 已验证过的 4h/6h/12h/24h 分级）。新增
+ *   Overdue 阶段（_processOverdueStage_），状态复用 task.reminder_count/
+ *   last_reminder_at（V1 时代就在用的字段，无需数据迁移），写入机制沿用
+ *   V1 的 SheetUtils.batchUpdateFieldsByKey_('Tasks', ...)。两个阶段共用
+ *   同一把锁、同一次 checkOffsetReminders() 轮询、同一个每5分钟触发器。
+ *   两处 Carson refinement 顺带落地：QUIET_HOURS_START_HOUR/END_HOUR 两个
+ *   裸变量重构成 QUIET_HOURS_CONFIG 对象（Overdue 阶段接入同一套既有
+ *   Quiet Hours 判断，不是重新做一套）；ReminderHistory 新增
+ *   stage/policy_source 两列（11_Setup.gs 新增
+ *   migrateSchemaReminderHistoryStages() 迁移函数）。
+ *
+ *   11_Setup.gs 的 createTriggers() 不再挂 checkReminders（V1 的每小时
+ *   触发器）——25_ReminderEngine.gs 文件本身没删，按迁移计划先观察
+ *   Overdue 阶段实际表现，确认无误后再手动删除文件，不是这次实现的一
+ *   部分。00_Project_Constitution.gs 的 P2（触发器描述）/P3（写入方
+ *   变更说明）/P4（REMINDER_INTERVAL_HOURS 数值去向）同步修订。
+ *
+ *   50_ReminderOffsetEngine_Tests.gs 改名 50_ReminderEngine_Tests.gs
+ *   （run_offset_tests.js 改名 run_reminder_tests.js），新增场景
+ *   A2（priority缺失落到MEDIUM）/J（Overdue基础发送）/K（间隔未到不重发）
+ *   /L（enabled=false不发送）/M（max_repeats到上限不发送）/N（Overdue
+ *   遇到Quiet Hours不发送），全部71项测试通过（真实执行，非仅语法检查）。
+ *
+ *   顺手发现两个建议清理、但不在本次改动范围内的死代码文件：
+ *   92_ReminderEngine.gs（2026-07-03 拆分前的原始文件，定义裸全局函数，
+ *   理论上可能跟 25_ReminderEngine.gs 同名函数冲突）、05_SheetUtils.gs
+ *   （疑似被 21_SheetUtils.gs 取代后遗留）。
+ *
+ * - 2026-07-21（hotfix，Carson 发现并修复）：上线后
+ *   checkOffsetReminders 触发器报错 TypeError:
+ *   ReminderEngine.checkOffsetReminders is not a function——
+ *   20_ReminderEngine.gs 和 25_ReminderEngine.gs 都声明了全局的
+ *   var ReminderEngine，后加载的 25_ReminderEngine.gs 覆盖了前者的绑定。
+ *   这正是上面那条"92_ReminderEngine.gs 可能同名冲突"提醒本该覆盖、却
+ *   没有实际检查到的同一类风险，只是撞在了 25_/20_ 这一对文件上，不是
+ *   92_。修复：25_ReminderEngine.gs（迁移观察期内的临时保留项）内部变量
+ *   改名 ReminderEngineV1，20_ReminderEngine.gs 不用改。完整记录见
+ *   00_ADR_007_Unified_Reminder_Engine.gs 的"2026-07-21 Hotfix"章节。
  */
 
 // ============================================================

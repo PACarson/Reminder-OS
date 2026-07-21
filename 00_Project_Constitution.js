@@ -5,7 +5,14 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-13 — 新增 P8（演进原则：保守优先，Claude 架构
+ * LAST_UPDATED: 2026-07-19 — Unified Reminder Engine（ADR-2026-07-19-007）：
+ * 修订 P2（触发器从 checkReminders 每小时+checkOffsetReminders 每5分钟
+ * 两个并存，改成 checkOffsetReminders 单一每5分钟触发器，同时承担
+ * Pre-Due 和 Overdue 两个阶段）；P3 追加写入方变更说明（边界本身不变）；
+ * P4 追加 REMINDER_INTERVAL_HOURS 数值去向说明（搬进新的
+ * OVERDUE_POLICY_CONFIG，不是丢弃）。25_ReminderEngine.gs 停用触发器、
+ * 文件本身保留观察期。
+ * 2026-07-13 — 新增 P8（演进原则：保守优先，Claude 架构
  * 复审会话固定应用的默认立场）；新增 P9（领域边界：Reminder OS 不是
  * Calendar OS，Future-Proof Architecture Validation 结论）。
  * 2026-07-11 — 修订 P3（读边界从"只读 Tasks"扩大为"读
@@ -40,21 +47,32 @@
  *
  * P2. 部署形态
  *     独立 Apps Script 项目，完全自主运作：自己的时间触发器
- *     （checkReminders，每小时）主动醒来、主动查、主动发 Telegram 消息。
- *     不接 Telegram webhook，不被任何项目当 Library 调用，也不调用任何
- *     项目的代码——跟 Personal AI Core / Productivity OS 之间唯一的联系
- *     是"读写同一张共享 Google Sheet"。
+ *     （checkOffsetReminders，每5分钟——2026-07-19 起这一个触发器同时
+ *     承担 Pre-Due 和 Overdue 两个阶段，取代原来 checkReminders 每小时+
+ *     checkOffsetReminders 每5分钟两个独立触发器并存的状态，完整决策
+ *     依据见 00_ADR_007_Unified_Reminder_Engine.txt）主动醒来、主动查、
+ *     主动发 Telegram 消息。不接 Telegram webhook，不被任何项目当
+ *     Library 调用，也不调用任何项目的代码——跟 Personal AI Core /
+ *     Productivity OS 之间唯一的联系是"读写同一张共享 Google Sheet"。
  *
  * P3. 数据边界
  *     只写 Tasks 表的 reminder_count/last_reminder_at 两个字段，不碰
  *     其他字段，不碰 ActiveTasks/ArchiveTasks 的任何写入；另外追加自己的
  *     REMINDER_SENT 事件到共享 Events 表。
  *
+ *     ✅ 2026-07-19 更新（Unified Reminder Engine）：这条边界本身没变，
+ *     只是写入方从 25_ReminderEngine.gs（V1，已停用触发器）换成
+ *     20_ReminderEngine.gs 的 Overdue 阶段——同样只写这两个字段，同样用
+ *     SheetUtils.batchUpdateFieldsByKey_ 做定点更新，不是重新设计一套
+ *     写入机制。25_ReminderEngine.gs 文件本身还在（迁移观察期），但它的
+ *     触发器已经摘掉，不会再实际写入。
+ *
  *     ✅ 2026-07-06 更新（外部审计 HIGH RISK 1 关联）：写 Tasks 表这两个
  *     字段的机制从"每个任务各自直接 upsertRowByKey_"改成"checkReminders()
  *     循环结束后 batchUpsertRowsByKey_ 一次性批量写"，仍然不通过
  *     Productivity OS、仍然只碰这两个字段，只是物理写入的时机和批次变了，
- *     见 2_Runtime/25_ReminderEngine.gs 的 HIGH RISK 1 修复说明。
+ *     见 2_Runtime/25_ReminderEngine.gs 的 HIGH RISK 1 修复说明（历史
+ *     记录，V1 现已停用，机制精神被 Overdue 阶段继承）。
  *
  *     ✅ 2026-07-10 更新（第四轮外部审计 HIGH RISK 1/MEDIUM RISK 1 关联）：
  *     两处进一步细化，边界本身（只写这两个字段、只追加 Events、不碰
@@ -105,6 +123,13 @@
  *     00_Project_State.gs「已完成」。REMINDER_INTERVAL_HOURS 数值本身
  *     没有变。这条 P4 上半段保留作为拆分时点的历史记录，不代表当前状态——
  *     当前状态以这一段"✅ 2026-07-06"为准。
+ *
+ *     ✅ 2026-07-19 更新（Unified Reminder Engine）：25_ReminderEngine.gs
+ *     的触发器已停用，REMINDER_INTERVAL_HOURS 这几个数值（4/6/12/24小时）
+ *     没有被丢弃——原样搬进了 20_ReminderEngine.gs 的
+ *     OVERDUE_POLICY_CONFIG（换算成分钟，按 priority 分组，新增
+ *     enabled/max_repeats 两个可配置项），不是重新设计的新数字。完整
+ *     决策依据见 00_ADR_007_Unified_Reminder_Engine.txt。
  *
  * P5. 架构分层（Domain OS Blueprint，2026-07-06 采用）
  *     本项目从这次起，文件按平台统一的 Domain OS Blueprint 分层组织：
